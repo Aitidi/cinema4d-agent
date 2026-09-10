@@ -16,8 +16,63 @@ import os
 import sys
 import base64
 import traceback
+from functools import wraps
+
+try:
+    import maxon
+except Exception:
+    maxon = None
+
+
+# Cinema 4D 2026.3.1 does not register Python wrappers for these two public
+# node interfaces. Register the minimal read-only surface once at module load
+# so Capsule asset identity can be extracted without private messages.
+if maxon is not None:
+    @maxon.MAXON_INTERFACE(
+        maxon.MAXON_REFERENCE_COPY_ON_WRITE,
+        "net.maxon.node.interface.nodetemplate",
+    )
+    class _CapsuleNodeTemplateInterface(maxon.AssetInterface):
+        pass
+
+
+    @maxon.MAXON_REFERENCE(_CapsuleNodeTemplateInterface)
+    class _CapsuleNodeTemplate(_CapsuleNodeTemplateInterface, maxon.Data):
+        def __new__(cls, *args):
+            return object.__new__(cls)
+
+
+    @maxon.MAXON_INTERFACE(
+        maxon.MAXON_REFERENCE_COPY_ON_WRITE,
+        "net.maxon.node.interface.nodesystem",
+    )
+    class _CapsuleNodeSystemInterface(maxon.ObjectInterface):
+        @maxon.MAXON_METHOD(
+            "net.maxon.node.interface.nodesystem.GetTemplate@c849c0c06c1a1ac5"
+        )
+        def GetTemplate(self):
+            pass
+
+        @maxon.MAXON_METHOD(
+            "net.maxon.node.interface.nodesystem.GetAllBases@4292dc8effe69932"
+        )
+        def GetAllBases(self):
+            pass
+
+
+    @maxon.MAXON_REFERENCE(_CapsuleNodeSystemInterface)
+    class _CapsuleNodeSystem(_CapsuleNodeSystemInterface, maxon.Data):
+        def __new__(cls, *args):
+            return object.__new__(cls)
+else:
+    _CapsuleNodeTemplateInterface = None
+    _CapsuleNodeTemplate = None
+    _CapsuleNodeSystemInterface = None
+    _CapsuleNodeSystem = None
 
 PLUGIN_ID = 1057843  # Unique plugin ID for SpecialEventAdd
+SERVICE_PLUGIN_ID = 1057844  # Background message dispatcher
+PREF_AUTO_LIFECYCLE = 10001
 
 # Check Cinema 4D version and log compatibility info
 C4D_VERSION = c4d.GetC4DVersion()
@@ -33,6 +88,22 @@ if C4D_VERSION_MAJOR < 20:
     )
 
 
+def main_thread_handler(func):
+    """Marshal a complete legacy command, including document lookup, to C4D."""
+    @wraps(func)
+    def dispatch(self, *args, **kwargs):
+        timeout = {
+            "handle_render_frame": 180,
+            "handle_render_preview_base64": 120,
+            "handle_snapshot_scene": 120,
+            "handle_execute_python": 30,
+        }.get(func.__name__, 60)
+        return self.execute_on_main_thread(
+            func, args=(self,) + args, kwargs=kwargs, _timeout=timeout
+        )
+    return dispatch
+
+
 class C4DSocketServer(threading.Thread):
     """Socket Server running in a background thread, sending logs & status via queue."""
 
@@ -44,6 +115,7 @@ class C4DSocketServer(threading.Thread):
         self.running = False
         self.msg_queue = msg_queue  # Queue to communicate with UI
         self.daemon = True  # Ensures cleanup on shutdown
+        self._request_context = threading.local()
 
         # --- ADDED FOR CONTEXT AWARENESS ---
         self._object_name_registry = (
@@ -67,7 +139,9 @@ class C4DSocketServer(threading.Thread):
         self.msg_queue.put(("STATUS", status))
         c4d.SpecialEventAdd(PLUGIN_ID)
 
-    def execute_on_main_thread(self, func, args=None, kwargs=None, _timeout=None):
+    def execute_on_main_thread(
+        self, func, args=None, kwargs=None, _timeout=None, _cancel_token=None
+    ):
         """Execute a function on the main thread using a thread-safe queue and special event.
 
         Since CallMainThread is not available in the Python SDK (R2025), we use
@@ -86,7 +160,32 @@ class C4DSocketServer(threading.Thread):
         kwargs = kwargs or {}
 
         # Extract the timeout parameter if provided, or use default
-        timeout = kwargs.pop("_timeout", None)
+        timeout = _timeout if _timeout is not None else kwargs.pop("_timeout", None)
+        cancel_token = _cancel_token if _cancel_token is not None else {"cancelled": False}
+
+        request_client = getattr(self._request_context, "client", None)
+        deadline = getattr(self._request_context, "deadline", None)
+
+        def request_expired():
+            if deadline is not None and time.time() >= deadline:
+                return True
+            if isinstance(request_client, socket.socket):
+                import select
+                try:
+                    readable, _, _ = select.select([request_client], [], [], 0)
+                    if readable and not request_client.recv(1, socket.MSG_PEEK):
+                        return True
+                except OSError:
+                    return True
+            return False
+
+        # Nested handlers (e.g. snapshot -> render) must not queue and wait
+        # for the main thread while already executing on it.
+        if c4d.threading.GeIsMainThread():
+            if cancel_token.get("cancelled") or request_expired():
+                return {"error": "Request cancelled", "error_code": "request_cancelled"}
+            c4d.StopAllThreads()
+            return func(*args, **kwargs)
 
         # Set appropriate timeout based on operation type
         if timeout is None:
@@ -113,9 +212,16 @@ class C4DSocketServer(threading.Thread):
         # Define a wrapper that will be executed on the main thread
         def main_thread_exec():
             try:
+                if cancel_token.get("cancelled") or request_expired():
+                    result_container["result"] = {
+                        "error": "Request expired before main-thread execution",
+                        "error_code": "request_cancelled",
+                    }
+                    return True
                 self.log(
                     f"[C4D] Starting main thread execution of {func.__name__ if hasattr(func, '__name__') else 'function'}"
                 )
+                c4d.StopAllThreads()
                 start_time = time.time()
                 result_container["result"] = func(*args, **kwargs)
                 execution_time = time.time() - start_time
@@ -157,9 +263,13 @@ class C4DSocketServer(threading.Thread):
                 last_progress = int(elapsed)
 
             # Check for timeout
-            if elapsed > timeout:
+            if elapsed > timeout or request_expired():
+                cancel_token["cancelled"] = True
                 self.log(f"[C4D] Main thread execution timed out after {elapsed:.2f}s")
-                return {"error": f"Execution on main thread timed out after {timeout}s"}
+                return {
+                    "error": f"Execution on main thread timed out after {timeout}s",
+                    "error_code": "main_thread_timeout",
+                }
 
         # Improved result handling
         if result_container["result"] is None:
@@ -192,7 +302,10 @@ class C4DSocketServer(threading.Thread):
                 threading.Thread(target=self.handle_client, args=(client,)).start()
 
         except Exception as e:
-            self.log(f"[C4D] Server Error: {str(e)}")
+            # Closing a listening socket interrupts accept() on Windows. This
+            # is the expected shutdown path, not a server failure.
+            if self.running:
+                self.log(f"[C4D] Server Error: {str(e)}")
             self.update_status("Offline")
             self.running = False
 
@@ -211,12 +324,19 @@ class C4DSocketServer(threading.Thread):
                 # Process complete messages (separated by newlines)
                 while "\n" in buffer:
                     message, buffer = buffer.split("\n", 1)
-                    self.log(f"[C4D] Received: {message}")
-
                     try:
                         # Parse the command
                         command = json.loads(message)
+                        self._request_context.client = client
+                        self._request_context.deadline = command.get("_deadline")
                         command_type = command.get("command", "")
+                        if str(command_type).startswith(("inspect_scene_nodes", "search_scene_node", "describe_scene_node", "edit_scene_nodes", "layout_scene_nodes", "inspect_capsule", "focus_capsule", "search_capsule", "describe_capsule", "edit_capsule", "layout_capsule")):
+                            self.log(
+                                f"[C4D] Received {command_type} "
+                                f"({len(command.get('operations', []))} operations)"
+                            )
+                        else:
+                            self.log(f"[C4D] Received command: {command_type}")
 
                         # Scene info & execution
                         if command_type == "get_scene_info":
@@ -251,11 +371,39 @@ class C4DSocketServer(threading.Thread):
                             response = self.handle_inspect_redshift_materials(command)
                         elif command_type == "validate_redshift_materials":
                             response = self.handle_validate_redshift_materials(command)
+                        elif command_type == "inspect_scene_nodes_graph":
+                            response = self.handle_inspect_scene_nodes_graph(command)
+                        elif command_type == "search_scene_node_assets":
+                            response = self.handle_search_scene_node_assets(command)
+                        elif command_type == "describe_scene_node_asset":
+                            response = self.handle_describe_scene_node_asset(command)
+                        elif command_type == "edit_scene_nodes_graph":
+                            response = self.handle_edit_scene_nodes_graph(command)
+                        elif command_type == "layout_scene_nodes_graph":
+                            response = self.handle_layout_scene_nodes_graph(command)
+                        elif command_type == "inspect_capsule_instances":
+                            response = self.handle_inspect_capsule_instances(command)
+                        elif command_type == "inspect_capsule_graph":
+                            response = self.handle_inspect_capsule_graph(command)
+                        elif command_type == "focus_capsule_graph":
+                            response = self.handle_focus_capsule_graph(command)
+                        elif command_type == "search_capsule_assets":
+                            response = self.handle_search_capsule_assets(command)
+                        elif command_type == "describe_capsule_asset":
+                            response = self.handle_describe_capsule_asset(command)
+                        elif command_type == "edit_capsule_graph":
+                            response = self.handle_edit_capsule_graph(command)
+                        elif command_type == "layout_capsule_graph":
+                            response = self.handle_layout_capsule_graph(command)
                         # Rendering & preview
                         elif command_type == "render_frame":
                             response = self.handle_render_frame(command)
                         elif command_type == "render_preview":
-                            response = self.handle_render_preview_base64()
+                            response = self.handle_render_preview_base64(
+                                frame=command.get("frame", 0),
+                                width=command.get("width", 640),
+                                height=command.get("height", 360),
+                            )
                         elif command_type == "snapshot_scene":
                             response = self.handle_snapshot_scene(command)
                         # Camera & light handling
@@ -313,6 +461,7 @@ class C4DSocketServer(threading.Thread):
         self.log("[C4D] Server stopped")
 
     # Basic commands
+    @main_thread_handler
     def handle_get_scene_info(self):
         """Handle get_scene_info command."""
         doc = c4d.documents.GetActiveDocument()
@@ -754,6 +903,7 @@ class C4DSocketServer(threading.Thread):
         )
         return all_objects
 
+    @main_thread_handler
     def handle_group_objects(self, command):
         """Handle group_objects command with GUID support."""
         doc = c4d.documents.GetActiveDocument()
@@ -964,6 +1114,7 @@ class C4DSocketServer(threading.Thread):
                     pass
             return {"error": error_msg, "traceback": traceback.format_exc()}
 
+    @main_thread_handler
     def handle_add_primitive(self, command):
         """Handle add_primitive command."""
         doc = c4d.documents.GetActiveDocument()
@@ -1289,6 +1440,7 @@ class C4DSocketServer(threading.Thread):
                 f"[**ERROR**] Failed to register object '{failed_name}': {e}\n{traceback.format_exc()}"
             )
 
+    @main_thread_handler
     def handle_render_preview_base64(self, frame=0, width=640, height=360):
         """SDK 2025-compliant base64 renderer with error resolution"""
         import c4d
@@ -1392,6 +1544,7 @@ class C4DSocketServer(threading.Thread):
         }
         return codes.get(code, f"Unknown error ({code})")
 
+    @main_thread_handler
     def handle_modify_object(self, command):
         """Handle modify_object command with full property support, GUID option, and Camera params."""
         doc = c4d.documents.GetActiveDocument()
@@ -1722,6 +1875,7 @@ class C4DSocketServer(threading.Thread):
             self.log(f"[**ERROR**] {error_msg}\n{traceback.format_exc()}")
             return {"error": error_msg, "traceback": traceback.format_exc()}
 
+    @main_thread_handler
     def handle_apply_material(self, command):
         """Handle apply_material command with GUID support."""
         doc = c4d.documents.GetActiveDocument()
@@ -2065,6 +2219,7 @@ class C4DSocketServer(threading.Thread):
 
     #         return {"error": f"Exception during render: {str(e)}"}
 
+    @main_thread_handler
     def handle_snapshot_scene(self, command=None):
         """
         Generates a snapshot: object list + base64 preview render.
@@ -2114,6 +2269,7 @@ class C4DSocketServer(threading.Thread):
             "render": render_info,
         }
 
+    @main_thread_handler
     def handle_set_keyframe(self, command):
         """Set a keyframe on an object, supporting both GUID and name lookup."""
         doc = c4d.documents.GetActiveDocument()
@@ -2702,6 +2858,7 @@ class C4DSocketServer(threading.Thread):
             )
             return False
 
+    @main_thread_handler
     def handle_save_scene(self, command):
         """Handle save_scene command."""
         file_path = command.get("file_path", "")
@@ -2769,6 +2926,7 @@ class C4DSocketServer(threading.Thread):
         )
         return result
 
+    @main_thread_handler
     def handle_load_scene(self, command):
         """Handle load_scene command with improved path handling."""
         file_path = command.get("file_path", "")
@@ -2857,16 +3015,16 @@ class C4DSocketServer(threading.Thread):
         def load_scene_on_main_thread(file_path):
             try:
                 # Load the document
-                new_doc = c4d.documents.LoadDocument(file_path, c4d.SCENEFILTER_NONE)
+                new_doc = c4d.documents.LoadDocument(
+                    file_path, c4d.SCENEFILTER_OBJECTS | c4d.SCENEFILTER_MATERIALS
+                )
                 if not new_doc:
                     return {"error": f"Failed to load document from {file_path}"}
-
-                # Set the new document as active
-                c4d.documents.SetActiveDocument(new_doc)
 
                 # Add the document to the documents list
                 # (only needed if the document wasn't loaded by the document manager)
                 c4d.documents.InsertBaseDocument(new_doc)
+                c4d.documents.SetActiveDocument(new_doc)
 
                 # Update Cinema 4D
                 c4d.EventAdd()
@@ -2881,10 +3039,11 @@ class C4DSocketServer(threading.Thread):
 
         # Execute the load function on the main thread with extended timeout
         result = self.execute_on_main_thread(
-            load_scene_on_main_thread, file_path, _timeout=60
+            load_scene_on_main_thread, args=(file_path,), _timeout=60
         )
         return result
 
+    @main_thread_handler
     def handle_execute_python(self, command):
         """Handle execute_python command with improved output capturing and error handling."""
         code = command.get("code", "")
@@ -3025,6 +3184,7 @@ class C4DSocketServer(threading.Thread):
 
         return result
 
+    @main_thread_handler
     def handle_create_mograph_cloner(self, command):
         """Handle create_mograph_cloner command with context and fixed parameter names."""
         doc = c4d.documents.GetActiveDocument()
@@ -3327,6 +3487,7 @@ class C4DSocketServer(threading.Thread):
                 "traceback": traceback.format_exc(),
             }
 
+    @main_thread_handler
     def handle_list_objects(self):
         """Handle list_objects command with comprehensive object detection including MoGraph objects."""
         doc = c4d.documents.GetActiveDocument()
@@ -3541,6 +3702,7 @@ class C4DSocketServer(threading.Thread):
         )
         return {"objects": objects}
 
+    @main_thread_handler
     def handle_add_effector(self, command):
         """Adds a MoGraph effector and optionally links it to a cloner, returns context."""
         doc = c4d.documents.GetActiveDocument()
@@ -3743,6 +3905,7 @@ class C4DSocketServer(threading.Thread):
                 "traceback": traceback.format_exc(),
             }
 
+    @main_thread_handler
     def handle_apply_mograph_fields(self, command):
         """Applies a MoGraph field (as a child) to a MoGraph effector, returns context."""
         doc = c4d.documents.GetActiveDocument()
@@ -3927,6 +4090,7 @@ class C4DSocketServer(threading.Thread):
                 "traceback": traceback.format_exc(),
             }
 
+    @main_thread_handler
     def handle_create_soft_body(self, command):
         """Handle create_soft_body command with GUID support."""
         doc = c4d.documents.GetActiveDocument()
@@ -4069,6 +4233,7 @@ class C4DSocketServer(threading.Thread):
             )
             return {"error": f"Failed to queue/execute Soft Body creation: {str(e)}"}
 
+    @main_thread_handler
     def handle_apply_dynamics(self, command):
         """Handle apply_dynamics command with GUID support."""
         doc = c4d.documents.GetActiveDocument()
@@ -4226,6 +4391,7 @@ class C4DSocketServer(threading.Thread):
                 "traceback": traceback.format_exc(),
             }
 
+    @main_thread_handler
     def handle_create_abstract_shape(self, command):
         """Handle create_abstract_shape command with context and C4D 2025 compatibility."""
         doc = c4d.documents.GetActiveDocument()
@@ -4469,6 +4635,7 @@ class C4DSocketServer(threading.Thread):
         self.log(f"[C4D] Found {len(all_objects)} objects in document")
         return all_objects
 
+    @main_thread_handler
     def handle_create_light(self, command):
         """Light creation with context and EXACT 2025.0 SDK parameters"""
         doc = c4d.documents.GetActiveDocument()
@@ -4614,6 +4781,7 @@ class C4DSocketServer(threading.Thread):
                 "traceback": traceback.format_exc(),
             }
 
+    @main_thread_handler
     def handle_create_camera(self, command):
         """Create a new camera, optionally pointing it towards a target."""
         doc = c4d.documents.GetActiveDocument()
@@ -4754,6 +4922,7 @@ class C4DSocketServer(threading.Thread):
                 "traceback": traceback.format_exc(),
             }
 
+    @main_thread_handler
     def handle_animate_camera(self, command):
         """Handle animate_camera command with context."""
         doc = c4d.documents.GetActiveDocument()
@@ -5782,6 +5951,7 @@ class C4DSocketServer(threading.Thread):
         )
         return graph_info
 
+    @main_thread_handler
     def handle_inspect_redshift_materials(self, command):
         """Inspect Redshift-like materials with runtime-safe fallbacks."""
         doc = c4d.documents.GetActiveDocument()
@@ -5883,6 +6053,7 @@ class C4DSocketServer(threading.Thread):
             "skipped_materials": skipped_materials,
         }
 
+    @main_thread_handler
     def handle_validate_redshift_materials(self, command):
         """Validate Redshift node materials in the scene and fix issues when possible."""
         import maxon
@@ -6281,6 +6452,7 @@ class C4DSocketServer(threading.Thread):
                 "warnings": warnings,
             }
 
+    @main_thread_handler
     def handle_create_material(self, command):
         """Handle create_material command with context and proper NodeMaterial support for Redshift."""
         doc = c4d.documents.GetActiveDocument()
@@ -6517,6 +6689,1565 @@ class C4DSocketServer(threading.Thread):
                     pass
             return {"error": error_msg, "traceback": traceback.format_exc()}
 
+    # Scene Nodes ---------------------------------------------------------
+    # Maxon graph objects are deliberately kept request-local.  GraphNode
+    # references become stale after transactions and must never be cached.
+
+    _SCENE_NODES_SPACE = "net.maxon.neutron.nodespace"
+
+    def _scene_nodes_error(self, message, code="scene_nodes_error", **details):
+        result = {"success": False, "error": message, "error_code": code}
+        result.update(details)
+        return result
+
+    def _require_scene_nodes(self):
+        if maxon is None:
+            raise RuntimeError("The Maxon Python API is not available")
+        if not hasattr(maxon, "GraphDescription"):
+            raise RuntimeError("GraphDescription is unavailable in this Cinema 4D build")
+
+    def _get_scene_nodes_graph(self, doc, create=False):
+        self._require_scene_nodes()
+        space = maxon.Id(self._SCENE_NODES_SPACE)
+        # In Cinema 4D 2026.3.1 the persistent document graph is owned by the
+        # Scene Nodes scene hook. Passing BaseDocument directly creates a
+        # detached graph which disappears after the request releases it.
+        owner = doc.FindSceneHook(maxon.neutron.SCENEHOOK_ID)
+        if owner is None:
+            if not create:
+                return None
+            owner = doc
+        if not create:
+            nimbus = owner.GetNimbusRef(space)
+            return nimbus.GetGraph() if nimbus else None
+        return maxon.GraphDescription.GetGraph(owner, space, True)
+
+    def _node_path(self, node):
+        return str(node.GetPath())
+
+    def _get_graph_node(self, graph, path, expected_kind=None):
+        if not isinstance(path, str) or not path:
+            raise ValueError("A non-empty absolute NodePath is required")
+        node = graph.GetNode(maxon.NodePath(path))
+        if not node or node.GetKind() == maxon.NODE_KIND.NONE:
+            raise LookupError(f"NodePath does not exist: {path}")
+        if expected_kind is not None and not (node.GetKind() & expected_kind):
+            raise TypeError(f"NodePath has the wrong node kind: {path}")
+        return node
+
+    def _resolve_node_ref(self, graph, value, op_nodes):
+        if isinstance(value, dict):
+            dependency = value.get("op_id") or value.get("ref")
+            if dependency:
+                state = op_nodes.get(str(dependency))
+                if not state or state.get("status") != "success":
+                    raise KeyError(str(dependency))
+                value = state["node_path"]
+            else:
+                value = value.get("node_path") or value.get("path")
+        elif isinstance(value, str) and value.startswith("$op:"):
+            dependency = value[4:]
+            state = op_nodes.get(dependency)
+            if not state or state.get("status") != "success":
+                raise KeyError(dependency)
+            value = state["node_path"]
+        return self._get_graph_node(graph, value, maxon.NODE_KIND.NODE)
+
+    def _resolve_port_ref(self, graph, value, op_nodes, default_node=None, direction=None):
+        if isinstance(value, str):
+            try:
+                return self._get_graph_node(graph, value, maxon.NODE_KIND.PORT_MASK)
+            except Exception:
+                if default_node is None:
+                    raise
+                node = self._resolve_node_ref(graph, default_node, op_nodes)
+                port_id = value.replace("\\", "/").split("/")[-1]
+                port_list = node.GetOutputs() if direction == "output" else node.GetInputs()
+                port = port_list.FindChild(port_id)
+                if not port or port.GetKind() == maxon.NODE_KIND.NONE:
+                    raise LookupError(f"Port does not exist: {value}")
+                return port
+        if not isinstance(value, dict):
+            raise ValueError("Port reference must be an absolute NodePath or an object")
+        path = value.get("port_path") or value.get("path")
+        if path:
+            return self._get_graph_node(graph, path, maxon.NODE_KIND.PORT_MASK)
+        node_ref = value.get("node") or value.get("node_path") or value.get("node_ref")
+        node = self._resolve_node_ref(graph, node_ref or default_node, op_nodes)
+        port_id = value.get("port_id") or value.get("id") or value.get("port")
+        if not port_id:
+            raise ValueError("Port reference requires port_path or port_id")
+        port_id = str(port_id).replace("\\", "/").split("/")[-1]
+        port_list = node.GetOutputs() if direction == "output" else node.GetInputs()
+        port = port_list.FindChild(port_id)
+        if not port or port.GetKind() == maxon.NODE_KIND.NONE:
+            raise LookupError(f"Port does not exist: {port_id}")
+        return port
+
+    def _jsonify_maxon(self, value, depth=0):
+        if depth > 8:
+            return {"unsupported_datatype": type(value).__name__}
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, (list, tuple)):
+            return [self._jsonify_maxon(item, depth + 1) for item in value]
+        if isinstance(value, dict):
+            return {str(key): self._jsonify_maxon(item, depth + 1) for key, item in value.items()}
+        if isinstance(value, c4d.Vector):
+            return {"type": "vector3", "value": [value.x, value.y, value.z]}
+        if isinstance(value, c4d.Matrix):
+            return {
+                "type": "matrix",
+                "value": [
+                    [value.off.x, value.off.y, value.off.z],
+                    [value.v1.x, value.v1.y, value.v1.z],
+                    [value.v2.x, value.v2.y, value.v2.z],
+                    [value.v3.x, value.v3.y, value.v3.z],
+                ],
+            }
+        type_name = type(value).__name__
+        if type_name in ("Id", "InternedId", "String"):
+            return str(value)
+        if type_name.startswith(("Vector", "Color")):
+            keys = ("r", "g", "b", "a") if type_name.startswith("Color") else ("x", "y", "z", "w")
+            components = [getattr(value, key) for key in keys if hasattr(value, key)]
+            return {"type": "color" if type_name.startswith("Color") else "vector", "value": components}
+        if type_name.startswith("Matrix"):
+            try:
+                offset = getattr(value, "off", getattr(value, "off_in", None))
+                square = getattr(value, "sqmat", value)
+                rows = [offset, square.v1, square.v2, square.v3]
+                return {"type": "matrix", "value": [self._jsonify_maxon(row, depth + 1).get("value") for row in rows]}
+            except Exception:
+                pass
+        if type_name == "Url":
+            return {"type": "url", "value": str(value)}
+        if type_name in ("TimeValue", "Time"):
+            try:
+                return {"type": "time", "value": value.GetSeconds()}
+            except Exception:
+                return {"type": "time", "value": str(value)}
+        try:
+            converted = maxon.MaxonConvert(value, maxon.CONVERSIONMODE.TOBUILTIN)
+            if converted is not value and isinstance(converted, (type(None), bool, int, float, str, list, tuple, dict)):
+                return self._jsonify_maxon(converted, depth + 1)
+        except Exception:
+            pass
+        data_type = type_name
+        try:
+            data_type = str(value.GetType().GetId())
+        except Exception:
+            try:
+                data_type = str(value._dt.GetId())
+            except Exception:
+                pass
+        return {"unsupported_datatype": data_type}
+
+    def _value_from_json(self, value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, list):
+            return [self._value_from_json(item) for item in value]
+        if not isinstance(value, dict):
+            raise TypeError("Complex port values require a typed object")
+        kind = str(value.get("type", "")).lower()
+        data = value.get("value")
+        if kind in ("id", "maxon_id"):
+            return maxon.Id(str(data))
+        if kind == "url":
+            return maxon.Url(str(data))
+        if kind in ("vector2", "vector3", "vector", "color", "vector4", "color4"):
+            if not isinstance(data, list):
+                raise TypeError(f"{kind} value must be an array")
+            constructors = {
+                "vector2": getattr(maxon, "Vector2d", None),
+                "vector3": getattr(maxon, "Vector", None),
+                "vector": getattr(maxon, "Vector", None),
+                "color": getattr(maxon, "Color", None),
+                "vector4": getattr(maxon, "Vector4d", None),
+                "color4": getattr(maxon, "ColorA", None),
+            }
+            ctor = constructors[kind]
+            if ctor is None:
+                raise TypeError(f"{kind} is unavailable in this Maxon API")
+            return ctor(*data)
+        if kind == "matrix":
+            ctor = getattr(maxon, "Matrix", None)
+            vector_ctor = getattr(maxon, "Vector", None)
+            if ctor is None or vector_ctor is None:
+                raise TypeError("matrix is unavailable in this Maxon API")
+            if not isinstance(data, list) or len(data) != 4 or any(not isinstance(row, list) or len(row) != 3 for row in data):
+                raise TypeError("matrix value must contain four vector3 rows: offset, v1, v2, v3")
+            return ctor(*(vector_ctor(*row) for row in data))
+        if kind == "time":
+            ctor = getattr(maxon, "TimeValue", None)
+            if ctor is None:
+                raise TypeError("time is unavailable in this Maxon API")
+            return ctor(float(data))
+        raise TypeError(f"Unsupported typed value: {kind or 'missing type'}")
+
+    def _port_info(self, port, direction, include_value=True):
+        result = {"path": self._node_path(port), "id": str(port.GetId()), "direction": direction}
+        try:
+            result["name"] = str(port.GetValue(maxon.NODE.BASE.NAME))
+        except Exception:
+            pass
+        try:
+            datatype = port.GetValue(maxon.DESCRIPTION.DATA.BASE.DATATYPE)
+            result["data_type"] = str(datatype)
+        except Exception:
+            pass
+        if include_value:
+            try:
+                result["value"] = self._jsonify_maxon(port.GetPortValue())
+            except Exception as exc:
+                result["value_error"] = type(exc).__name__
+        return result
+
+    def _port_nodes(self, port_list):
+        result = []
+        queue_ports = list(port_list.GetChildren(mask=maxon.NODE_KIND.PORT_MASK))
+        while queue_ports:
+            port = queue_ports.pop(0)
+            result.append(port)
+            try:
+                queue_ports.extend(port.GetChildren(mask=maxon.NODE_KIND.PORT_MASK))
+            except Exception:
+                pass
+        return result
+
+    def _port_entries(self, port_list, direction, include_values):
+        return [self._port_info(port, direction, include_values) for port in self._port_nodes(port_list)]
+
+    def _node_info(self, node, include_ports=True, include_values=True):
+        result = {"path": self._node_path(node)}
+        for attr, key in ((maxon.NODE.BASE.NAME, "name"), (maxon.NODE.BASE.ASSETVERSION, "asset_version")):
+            try:
+                value = node.GetValue(attr)
+                if value is not None:
+                    result[key] = str(value)
+            except Exception:
+                pass
+        if include_ports:
+            result["inputs"] = self._port_entries(node.GetInputs(), "input", include_values)
+            result["outputs"] = self._port_entries(node.GetOutputs(), "output", False)
+        return result
+
+    def _all_graph_nodes(self, graph):
+        return graph.GetRoot().GetChildren(mask=maxon.NODE_KIND.NODE)
+
+    def _graph_connections(self, nodes, max_connections):
+        connections = []
+        seen = set()
+        for node in nodes:
+            for port in self._port_nodes(node.GetOutputs()):
+                for target, wires in port.GetConnections(maxon.PORT_DIR.OUTPUT):
+                    key = (self._node_path(port), self._node_path(target))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    connections.append({"source": key[0], "target": key[1], "wires": str(wires)})
+                    if len(connections) >= max_connections:
+                        return connections, True
+        return connections, False
+
+    def _atomic_debug_write(self, debug_path, payload):
+        if not debug_path:
+            return
+        path = os.path.abspath(str(debug_path))
+        if not os.path.isabs(str(debug_path)) or os.path.splitext(path)[1].lower() != ".json":
+            raise ValueError("debug_path must be an absolute .json path")
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            raise ValueError("debug_path parent directory does not exist")
+        temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=True, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+    def _inspect_scene_nodes_main(self, command, cancel_token):
+        if cancel_token.get("cancelled"):
+            return self._scene_nodes_error("Request cancelled", "request_cancelled")
+        doc = c4d.documents.GetActiveDocument()
+        graph = self._get_scene_nodes_graph(doc, False)
+        if graph is None:
+            return {"success": True, "node_space": self._SCENE_NODES_SPACE, "graph_exists": False, "nodes": [], "connections": [], "truncated": False}
+        max_nodes = max(1, min(int(command.get("max_nodes", command.get("limit", 200))), 2000))
+        max_ports = max(1, min(int(command.get("max_ports", 2000)), 10000))
+        max_connections = max(1, min(int(command.get("max_connections", 2000)), 10000))
+        filters = set(command.get("node_paths") or ([command["node_path"]] if command.get("node_path") else []))
+        all_nodes = [node for node in self._all_graph_nodes(graph) if not filters or self._node_path(node) in filters]
+        truncated = len(all_nodes) > max_nodes
+        selected = all_nodes[:max_nodes]
+        node_data = []
+        port_count = 0
+        for node in selected:
+            info = self._node_info(
+                node,
+                bool(command.get("include_ports", True)),
+                bool(command.get("include_values", True)),
+            )
+            ports = info.get("inputs", []) + info.get("outputs", [])
+            if port_count + len(ports) > max_ports:
+                allowance = max(0, max_ports - port_count)
+                combined = ports[:allowance]
+                inputs_count = min(len(info.get("inputs", [])), allowance)
+                info["inputs"] = combined[:inputs_count]
+                info["outputs"] = combined[inputs_count:]
+                truncated = True
+            port_count += len(info.get("inputs", [])) + len(info.get("outputs", []))
+            node_data.append(info)
+            if port_count >= max_ports:
+                truncated = truncated or len(node_data) < len(selected)
+                break
+        if command.get("include_connections", True):
+            connections, connections_truncated = self._graph_connections(selected, max_connections)
+        else:
+            connections, connections_truncated = [], False
+        result = {"success": True, "node_space": self._SCENE_NODES_SPACE, "graph_exists": True, "modification_stamp": str(graph.GetModificationStamp()), "nodes": node_data, "connections": connections, "truncated": bool(truncated or connections_truncated), "limits": {"max_nodes": max_nodes, "max_ports": max_ports, "max_connections": max_connections}}
+        max_bytes = max(4096, min(int(command.get("max_bytes", 2000000)), 16000000))
+        if len(json.dumps(result, ensure_ascii=True)) > max_bytes:
+            result["connections"] = []
+            result["truncated"] = True
+            result["truncation_reason"] = "max_bytes"
+            for node in result["nodes"]:
+                for port in node.get("inputs", []):
+                    port.pop("value", None)
+            while result["nodes"] and len(json.dumps(result, ensure_ascii=True)) > max_bytes:
+                result["nodes"].pop()
+        try:
+            self._atomic_debug_write(command.get("debug_path"), result)
+        except Exception as exc:
+            result["debug_error"] = str(exc)
+        return result
+
+    def handle_inspect_scene_nodes_graph(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._inspect_scene_nodes_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _search_scene_node_assets_main(self, command, cancel_token):
+        self._require_scene_nodes()
+        # AssetTypes.NodeTemplate is a registry declaration in 2026.3.1, not
+        # an AssetType instance accepted by FindAssets. Normalize it once to
+        # the underlying Id and keep a string fallback for older builds.
+        node_template_type = maxon.AssetTypes.NodeTemplate
+        try:
+            node_template_type = maxon.Id(str(node_template_type.GetId()))
+        except Exception:
+            node_template_type = maxon.Id(str(node_template_type))
+        repositories = (
+            maxon.AssetInterface.GetUserPrefsRepository(),
+            maxon.AssetInterface.GetApplicationRepository(),
+            maxon.AssetInterface.GetBuiltinRepository(),
+        )
+        query = str(command.get("query", "")).lower().strip()
+        category_filter = str(command.get("category", "")).lower().strip()
+        limit = max(1, min(int(command.get("limit", 100)), 1000))
+        results = []
+        seen_assets = set()
+        # NodeTemplate metadata does not reliably expose NodeSpace in 2026.3.1.
+        # Probe candidates in a temporary, rollback-only graph when metadata is absent.
+        probe_doc = c4d.documents.BaseDocument()
+        probe_graph = None
+        try:
+            probe_graph = self._get_scene_nodes_graph(probe_doc, True)
+
+            def is_scene_node_asset(asset_id, node_space):
+                if self._SCENE_NODES_SPACE in node_space:
+                    return True
+                if node_space:
+                    return False
+                try:
+                    with probe_graph.BeginTransaction() as transaction:
+                        probe_graph.AddChild(maxon.Id(), maxon.Id(asset_id))
+                        transaction.Rollback()
+                    return True
+                except Exception:
+                    return False
+
+            for repository in repositories:
+                assets = repository.FindAssets(node_template_type, findMode=maxon.ASSET_FIND_MODE.LATEST)
+                for asset in assets:
+                    if cancel_token.get("cancelled"):
+                        break
+                    asset_id = str(asset.GetId())
+                    if asset_id in seen_assets:
+                        continue
+                    seen_assets.add(asset_id)
+                    metadata = asset.GetMetaData()
+                    try:
+                        node_space = str(metadata.Get(maxon.ASSETMETADATA.NodeSpace, ""))
+                    except Exception:
+                        node_space = ""
+                    try:
+                        name = str(asset.GetMetaString(maxon.OBJECT.BASE.NAME, fallback=asset_id))
+                    except Exception:
+                        name = asset_id
+                    if query and query not in f"{asset_id} {name}".lower():
+                        continue
+                    try:
+                        category = str(metadata.Get(maxon.ASSETMETADATA.Category, ""))
+                    except Exception:
+                        category = ""
+                    if category_filter and category_filter not in category.lower():
+                        continue
+                    if not is_scene_node_asset(asset_id, node_space):
+                        continue
+                    entry = {"asset_id": asset_id, "version": str(asset.GetVersion()), "name": name, "node_space": self._SCENE_NODES_SPACE}
+                    if category:
+                        entry["category"] = category
+                    try:
+                        entry["source"] = str(asset.GetRepositoryId())
+                    except Exception:
+                        pass
+                    results.append(entry)
+                    if len(results) >= limit:
+                        break
+                if cancel_token.get("cancelled") or len(results) >= limit:
+                    break
+            return {"success": True, "assets": results, "count": len(results), "truncated": len(results) >= limit, "cancelled": cancel_token.get("cancelled", False)}
+        finally:
+            probe_graph = None
+            c4d.documents.KillDocument(probe_doc)
+            probe_doc = None
+
+    def handle_search_scene_node_assets(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._search_scene_node_assets_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _describe_scene_node_asset_main(self, command, cancel_token):
+        asset_id = command.get("asset_id")
+        if not asset_id:
+            return self._scene_nodes_error("asset_id is required", "invalid_request")
+        temp_doc = c4d.documents.BaseDocument()
+        graph = node = transaction = None
+        try:
+            graph = self._get_scene_nodes_graph(temp_doc, True)
+            with graph.BeginTransaction() as transaction:
+                node = graph.AddChild(maxon.Id(), maxon.Id(str(asset_id)))
+                result = {"success": True, "asset_id": str(asset_id), "node": self._node_info(node, True, True)}
+                # Deliberately do not commit: leaving the context rolls back.
+            return result
+        except Exception as exc:
+            return self._scene_nodes_error(str(exc), "asset_description_failed", asset_id=str(asset_id))
+        finally:
+            transaction = node = graph = None
+            c4d.documents.KillDocument(temp_doc)
+            temp_doc = None
+
+    def handle_describe_scene_node_asset(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._describe_scene_node_asset_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _transaction_user_data(self, undo_mode):
+        data = maxon.DataDictionary()
+        data.Set(maxon.nodes.UndoMode, undo_mode)
+        return data
+
+    def _operation_kind(self, operation):
+        return str(operation.get("type") or operation.get("operation") or operation.get("action") or "").lower()
+
+    def _operation_dependency(self, operation):
+        refs = []
+        def visit(value):
+            if isinstance(value, dict):
+                dep = value.get("op_id") or value.get("ref")
+                if dep:
+                    refs.append(str(dep))
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+            elif isinstance(value, str) and value.startswith("$op:"):
+                refs.append(value[4:])
+        for key, value in operation.items():
+            if key != "op_id":
+                visit(value)
+        return refs
+
+    def _apply_scene_node_operation(self, graph, operation, op_nodes):
+        kind = self._operation_kind(operation)
+        if kind == "add_node":
+            asset_id = operation.get("asset_id") or operation.get("node_id")
+            if not asset_id:
+                raise ValueError("add_node requires asset_id")
+            child_id = operation.get("child_id")
+            node = graph.AddChild(
+                maxon.Id(str(child_id)) if child_id else maxon.Id(),
+                maxon.Id(str(asset_id)),
+            )
+            return node, {"node_path": self._node_path(node), "asset_id": str(asset_id)}
+        if kind == "set_port_value":
+            port = self._resolve_port_ref(graph, operation.get("port") or operation.get("port_path") or operation, op_nodes, operation.get("node"), "input")
+            port.SetPortValue(self._value_from_json(operation.get("value")))
+            node = port.GetAncestor(maxon.NODE_KIND.NODE)
+            return node, {"node_path": self._node_path(node), "port_path": self._node_path(port)}
+        if kind in ("connect_ports", "disconnect_ports"):
+            source_ref = operation.get("source") or operation.get("source_port")
+            if source_ref is None and (operation.get("source_node") or operation.get("source_port_id")):
+                source_ref = {"node": operation.get("source_node"), "port_id": operation.get("source_port_id")}
+            target_ref = operation.get("target") or operation.get("target_port")
+            if target_ref is None and (operation.get("target_node") or operation.get("target_port_id")):
+                target_ref = {"node": operation.get("target_node"), "port_id": operation.get("target_port_id")}
+            source = self._resolve_port_ref(graph, source_ref, op_nodes, direction="output")
+            target = self._resolve_port_ref(graph, target_ref, op_nodes, direction="input")
+            if kind == "connect_ports":
+                if not source.IsConnectable(target):
+                    raise TypeError("Ports are not connectable")
+                source.Connect(target)
+            else:
+                maxon.GraphModelHelper.RemoveConnection(source, target)
+            return source.GetAncestor(maxon.NODE_KIND.NODE), {"source_port": self._node_path(source), "target_port": self._node_path(target)}
+        if kind == "remove_node":
+            node = self._resolve_node_ref(graph, operation.get("node") or operation.get("node_path") or operation.get("path"), op_nodes)
+            path = self._node_path(node)
+            node.Remove()
+            return None, {"node_path": path}
+        raise ValueError(f"Unsupported operation type: {kind or '<empty>'}")
+
+    def _connected_component(self, graph, seed_paths):
+        queue_paths = list(seed_paths)
+        visited = set()
+        while queue_paths:
+            path = queue_paths.pop(0)
+            if path in visited:
+                continue
+            try:
+                node = self._get_graph_node(graph, path, maxon.NODE_KIND.NODE)
+            except Exception:
+                continue
+            visited.add(path)
+            for port_list, direction in ((node.GetInputs(), maxon.PORT_DIR.INPUT), (node.GetOutputs(), maxon.PORT_DIR.OUTPUT)):
+                for port in self._port_nodes(port_list):
+                    for other, _wires in port.GetConnections(direction):
+                        owner = other.GetAncestor(maxon.NODE_KIND.NODE)
+                        owner_path = self._node_path(owner)
+                        if owner_path not in visited:
+                            queue_paths.append(owner_path)
+        return visited
+
+    def _layout_scene_nodes(self, graph, scope, seed_paths=None, undo_mode=None):
+        if scope == "none":
+            return {"layout_status": "skipped", "layout_node_count": 0}
+        all_nodes = self._all_graph_nodes(graph)
+        if scope == "all":
+            targets = all_nodes
+        elif scope == "selected":
+            targets = maxon.GraphModelHelper.GetSelectedNodes(graph, maxon.NODE_KIND.NODE)
+        elif scope == "component":
+            paths = self._connected_component(graph, seed_paths or [])
+            targets = [node for node in all_nodes if self._node_path(node) in paths]
+        else:
+            return {"layout_status": "failed", "layout_node_count": 0, "layout_error": f"Invalid layout scope: {scope}"}
+        if not targets:
+            return {"layout_status": "skipped", "layout_node_count": 0, "layout_scope": scope}
+        previous = maxon.GraphModelHelper.GetSelectedNodes(graph, maxon.NODE_KIND.NODE)
+        transaction = None
+        try:
+            transaction_data = (
+                self._transaction_user_data(undo_mode)
+                if undo_mode is not None
+                else maxon.DataDictionary()
+            )
+            transaction = graph.BeginTransaction(transaction_data)
+            maxon.GraphModelHelper.DeselectAll(graph, maxon.NODE_KIND.NODE)
+            for node in targets:
+                maxon.GraphModelHelper.SelectNode(node)
+            try:
+                maxon.GraphDescription.ApplyDescription(
+                    graph,
+                    {
+                        maxon.GraphDescription.Commands: {
+                            str(maxon.NODE.BASE.LAYOUTSELECTED): {}
+                        }
+                    },
+                    nodeSpace=self._SCENE_NODES_SPACE,
+                )
+            except Exception as exc:
+                transaction.Rollback()
+                transaction = None
+                return {
+                    "layout_status": "unavailable",
+                    "layout_node_count": len(targets),
+                    "layout_scope": scope,
+                    "layout_error": (
+                        "The native layout-selected command is not callable from "
+                        f"the Cinema 4D 2026.3.1 Python API: {exc}"
+                    ),
+                }
+            maxon.GraphModelHelper.DeselectAll(graph, maxon.NODE_KIND.NODE)
+            for node in previous:
+                maxon.GraphModelHelper.SelectNode(node)
+            transaction.Commit()
+            transaction = None
+            return {"layout_status": "applied", "layout_node_count": len(targets), "layout_scope": scope}
+        except Exception as exc:
+            if transaction is not None:
+                try:
+                    transaction.Rollback()
+                except Exception:
+                    pass
+            return {"layout_status": "failed", "layout_node_count": len(targets), "layout_scope": scope, "layout_error": str(exc)}
+
+    def _edit_scene_nodes_main(self, command, cancel_token):
+        operations = command.get("operations") or []
+        if not isinstance(operations, list) or not operations:
+            return self._scene_nodes_error("operations must be a non-empty array", "invalid_request")
+        doc = c4d.documents.GetActiveDocument()
+        graph = self._get_scene_nodes_graph(doc, True)
+        states = {}
+        results = []
+        affected_paths = set()
+        success_count = 0
+        seen_ids = set()
+
+        def record_operation(item):
+            try:
+                item["modification_stamp"] = str(graph.GetModificationStamp())
+            except Exception:
+                pass
+            results.append(item)
+            states[item["op_id"]] = item
+
+        for index, operation in enumerate(operations):
+            op_id = str(operation.get("op_id") or f"op_{index + 1}") if isinstance(operation, dict) else f"op_{index + 1}"
+            if op_id in seen_ids:
+                item = {"op_id": op_id, "status": "error", "error_code": "duplicate_op_id", "error": "op_id must be unique"}
+                record_operation(item)
+                continue
+            seen_ids.add(op_id)
+            if cancel_token.get("cancelled"):
+                item = {"op_id": op_id, "status": "skipped", "error_code": "request_cancelled", "error": "Request timed out; remaining operations were not executed"}
+                record_operation(item)
+                continue
+            if not isinstance(operation, dict):
+                item = {"op_id": op_id, "status": "error", "error_code": "invalid_operation", "error": "Operation must be an object"}
+                record_operation(item)
+                continue
+            failed_dependencies = [dep for dep in self._operation_dependency(operation) if dep not in states or states[dep].get("status") != "success"]
+            if failed_dependencies:
+                item = {"op_id": op_id, "status": "dependency_failed", "error_code": "dependency_failed", "dependencies": failed_dependencies}
+                record_operation(item)
+                continue
+            try:
+                undo_mode = maxon.nodes.UNDO_MODE.START if success_count == 0 else maxon.nodes.UNDO_MODE.ADD
+                with graph.BeginTransaction(self._transaction_user_data(undo_mode)) as transaction:
+                    node, details = self._apply_scene_node_operation(graph, operation, states)
+                    transaction.Commit()
+                item = {"op_id": op_id, "type": self._operation_kind(operation), "status": "success"}
+                item.update(details)
+                if node is not None:
+                    affected_paths.add(self._node_path(node))
+                success_count += 1
+            except KeyError as exc:
+                item = {"op_id": op_id, "status": "dependency_failed", "error_code": "dependency_failed", "dependencies": [str(exc).strip("'")]}
+            except Exception as exc:
+                item = {"op_id": op_id, "type": self._operation_kind(operation), "status": "error", "error_code": "operation_failed", "error": str(exc)}
+            record_operation(item)
+        layout = {"layout_status": "skipped", "layout_node_count": 0}
+        if command.get("layout_after_batch", True) and success_count:
+            layout = self._layout_scene_nodes(
+                graph,
+                str(command.get("layout", "component")).lower(),
+                affected_paths,
+                maxon.nodes.UNDO_MODE.ADD,
+            )
+        c4d.EventAdd()
+        result = {"success": success_count > 0 and not cancel_token.get("cancelled"), "partial_success": 0 < success_count < len(operations), "operation_count": len(operations), "success_count": success_count, "operations": results, "modification_stamp": str(graph.GetModificationStamp())}
+        result.update(layout)
+        try:
+            self._atomic_debug_write(command.get("debug_path"), result)
+        except Exception as exc:
+            result["debug_error"] = str(exc)
+        states.clear()
+        return result
+
+    def handle_edit_scene_nodes_graph(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._edit_scene_nodes_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _layout_scene_nodes_main(self, command, cancel_token):
+        if cancel_token.get("cancelled"):
+            return self._scene_nodes_error("Request cancelled", "request_cancelled")
+        graph = self._get_scene_nodes_graph(c4d.documents.GetActiveDocument(), False)
+        if graph is None:
+            return {"success": True, "graph_exists": False, "layout_status": "skipped", "layout_node_count": 0}
+        scope = str(command.get("scope", "component")).lower()
+        if scope == "all" and command.get("scope") != "all":
+            return self._scene_nodes_error("Full graph layout must be explicitly requested", "explicit_all_required")
+        seeds = command.get("node_paths") or ([command["node_path"]] if command.get("node_path") else [])
+        result = {"success": True, "graph_exists": True}
+        result.update(
+            self._layout_scene_nodes(
+                graph, scope, seeds, maxon.nodes.UNDO_MODE.START
+            )
+        )
+        c4d.EventAdd()
+        return result
+
+    def handle_layout_scene_nodes_graph(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._layout_scene_nodes_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    # Capsule graphs -------------------------------------------------------
+    # A graph_target is a value object. It is resolved again for every
+    # request; Nimbus, graph, node and transaction references never escape a
+    # main-thread handler.
+
+    def _iter_capsule_owners(self, doc):
+        def walk_objects(node, parent_path):
+            while node is not None:
+                name = node.GetName() or str(node.GetType())
+                path = parent_path + [name]
+                yield node, "object", "/".join(path)
+                tag = node.GetFirstTag()
+                while tag is not None:
+                    tag_name = tag.GetName() or str(tag.GetType())
+                    yield tag, "tag", "/".join(path + ["@" + tag_name])
+                    tag = tag.GetNext()
+                child = node.GetDown()
+                if child is not None:
+                    for entry in walk_objects(child, path):
+                        yield entry
+                node = node.GetNext()
+
+        root = doc.GetFirstObject()
+        if root is not None:
+            for entry in walk_objects(root, []):
+                yield entry
+
+    def _capsule_owner_guid(self, owner, nimbus=None):
+        # Nimbus UUIDs are the only public identifier which also works for
+        # tags and survives owner renames. Keep the historical field name in
+        # the wire contract, but store the Nimbus UUID in it.
+        if nimbus is not None:
+            try:
+                uuid = nimbus.BaseList2DToUuid(owner)
+                if uuid is not None and str(uuid):
+                    return str(uuid)
+            except Exception:
+                pass
+        try:
+            return str(owner.GetGUID())
+        except Exception:
+            # BaseTag has no GetGUID in the 2026.3.1 Python API. Build a
+            # document-stable locator from its host object plus tag position.
+            host = owner.GetObject()
+            if host is None:
+                return "detached-tag:" + str(owner.GetType())
+            index = 0
+            tag = host.GetFirstTag()
+            while tag is not None and tag != owner:
+                index += 1
+                tag = tag.GetNext()
+            return "tag:" + str(host.GetGUID()) + ":" + str(owner.GetType()) + ":" + str(index)
+
+    def _capsule_node_path(self, owner, nimbus, graph):
+        candidates = []
+        try:
+            candidates.append(owner[maxon.neutron.NEUTRON_INSTANCE_NODE_PATH])
+        except Exception:
+            pass
+        try:
+            candidates.append(nimbus.GetPath(maxon.NIMBUS_PATH.STARTNODE))
+        except Exception:
+            pass
+        for value in candidates:
+            if value is None:
+                continue
+            path = str(value)
+            if not path:
+                continue
+            try:
+                node = graph.GetNode(maxon.NodePath(path))
+                if node and node.GetKind() != maxon.NODE_KIND.NONE:
+                    return path
+            except Exception:
+                pass
+        return ""
+
+    def _capsule_graph_node_asset_id(self, node):
+        for attribute in (maxon.nodes.CapsuleAssetId, maxon.nodes.AssetId):
+            try:
+                value = node.GetValue(attribute)
+                if isinstance(value, (tuple, list)):
+                    value = value[0] if value else None
+                elif not isinstance(value, str):
+                    # Maxon tuple-like Data values are not Python tuples, but
+                    # expose their first item through indexing.
+                    try:
+                        value = value[0]
+                    except Exception:
+                        pass
+                value = str(value or "").strip()
+                # An empty Maxon Id stored in a tuple-like Data value is
+                # rendered as ``(,)`` by Cinema 4D 2026.3.1. It is not an
+                # asset identity and must not turn implementation nodes such
+                # as ``builder`` into nested Capsule targets.
+                if value and value not in ("(,)", "()"):
+                    return value
+            except Exception:
+                pass
+        return ""
+
+    def _capsule_asset_identity(self, graph, capsule_path):
+        asset_id = ""
+        asset_version = ""
+        asset_repository = ""
+        identity_status = "unavailable"
+        node_system = template = None
+        if capsule_path:
+            try:
+                node = graph.GetNode(maxon.NodePath(capsule_path))
+                asset_id = self._capsule_graph_node_asset_id(node)
+            except Exception:
+                pass
+            try:
+                asset_version = str(node.GetValue(maxon.NODE.BASE.ASSETVERSION) or "")
+            except Exception:
+                pass
+            if asset_id:
+                identity_status = "node_attribute"
+            else:
+                # Once an editable Capsule instance is materialized, C4D can
+                # clear its direct AssetId. Graph.GetBase(node) then reports
+                # implementation/owner templates, not the original Capsule.
+                # Do not substitute those unrelated identities.
+                return "", "", "", "unavailable_after_materialization"
+        if not asset_id and _CapsuleNodeSystemInterface is not None:
+            try:
+                identity_node = graph.GetRoot()
+                if capsule_path:
+                    candidate = graph.GetNode(maxon.NodePath(capsule_path))
+                    if candidate and candidate.GetKind() != maxon.NODE_KIND.NONE:
+                        identity_node = candidate
+                node_system = graph.GetBase(identity_node)
+                selected = [None]
+
+                def take_first_base(base_system):
+                    try:
+                        selected[0] = base_system.GetTemplate()
+                    except Exception:
+                        selected[0] = None
+                    return False
+
+                node_system.GetAllBases(take_first_base)
+                template = selected[0]
+                if template is not None:
+                    identity_status = "base_template"
+                else:
+                    template = node_system.GetTemplate()
+                    identity_status = "root_template_fallback"
+                if template is not None:
+                    asset_id = str(template.GetId() or "")
+                    try:
+                        asset_version = str(template.GetVersion() or "")
+                    except Exception:
+                        pass
+                    try:
+                        asset_repository = str(template.GetRepositoryId() or "")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                template = node_system = None
+        return asset_id, asset_version, asset_repository, identity_status
+
+    def _capsule_inner_paths(self, graph, root_path=""):
+        """Return nested nodes which expose an inner node system."""
+        scoped_graph = graph
+        try:
+            if root_path:
+                include_all = maxon.NodeSystemManagerInterface.FILTER.INCLUDE_ALL
+                if isinstance(include_all, tuple):
+                    include_all = include_all[0]
+                scoped_graph = graph.CreateView(include_all, maxon.NodePath(root_path))
+            queue_nodes = list(scoped_graph.GetRoot().GetChildren(mask=maxon.NODE_KIND.NODE))
+            result = []
+            while queue_nodes:
+                node = queue_nodes.pop(0)
+                try:
+                    children = list(node.GetChildren(mask=maxon.NODE_KIND.NODE))
+                except Exception:
+                    children = []
+                if node.GetKind() == maxon.NODE_KIND.NODE:
+                    path = self._node_path(node)
+                    asset_id, _version, _repository, _status = self._capsule_asset_identity(
+                        graph, path
+                    )
+                    leaf_id = path.rsplit("/", 1)[-1]
+                    if (asset_id or "@" in leaf_id) and path and path != root_path:
+                        result.append(path)
+                    queue_nodes.extend(children)
+            return result
+        except Exception:
+            return []
+        finally:
+            scoped_graph = None
+
+    def _capsule_is_locked(self, owner):
+        try:
+            doc = owner.GetDocument()
+            layer = owner.GetLayerObject(doc) if doc is not None else None
+            if layer is None:
+                return False
+            data = layer.GetLayerData(doc)
+            if isinstance(data, dict):
+                return bool(data.get("locked") or data.get(c4d.ID_LAYER_LOCKED))
+            return bool(data[c4d.ID_LAYER_LOCKED])
+        except Exception:
+            return False
+
+    def _capsule_is_editable(self, owner, graph):
+        # MSG_IS_CAPSULE_EDITABLE requires an internal payload which is not
+        # published for Python. Calling BaseList2D.Message without that payload
+        # can terminate Cinema 4D 2026.3.1, so it is intentionally not used.
+        if self._capsule_is_locked(owner):
+            return False
+        try:
+            checker = getattr(graph, "IsReadOnly", None)
+            if checker is not None:
+                return not bool(checker())
+        except Exception:
+            return False
+        return True
+
+    def _capsule_entry(self, owner, owner_type, hierarchy_path, space_id, nimbus, capsule_path=None):
+        graph = nimbus.GetGraph()
+        if capsule_path is None:
+            capsule_path = self._capsule_node_path(owner, nimbus, graph)
+        asset_id, asset_version, asset_repository, identity_status = self._capsule_asset_identity(graph, capsule_path)
+        # c4d.Ocapsule is the geometric Capsule primitive, not a nodal
+        # Capsule marker. A scoped path or CapsuleAssetId is authoritative.
+        is_capsule = bool(capsule_path or asset_id)
+        editable_graph = graph
+        try:
+            if capsule_path:
+                include_all = maxon.NodeSystemManagerInterface.FILTER.INCLUDE_ALL
+                if isinstance(include_all, tuple):
+                    include_all = include_all[0]
+                editable_graph = graph.CreateView(include_all, maxon.NodePath(capsule_path))
+                if editable_graph is None:
+                    raise LookupError("graph_not_exposed: Capsule scoped graph view is unavailable")
+            editable = self._capsule_is_editable(owner, editable_graph)
+        finally:
+            editable_graph = None
+        target = {
+            "owner_guid": self._capsule_owner_guid(owner, nimbus),
+            "owner_type": owner_type,
+            "node_space": str(space_id),
+            "capsule_node_path": capsule_path,
+            "asset_id": asset_id,
+            "asset_version": asset_version,
+            "asset_repository": asset_repository,
+            "asset_identity_status": identity_status,
+        }
+        return {
+            "owner_guid": target["owner_guid"],
+            "owner_type": owner_type,
+            "owner_name": owner.GetName(),
+            "hierarchy_path": hierarchy_path,
+            "type_id": owner.GetType(),
+            "is_capsule": is_capsule,
+            "asset_id": asset_id,
+            "asset_version": asset_version,
+            "node_space": str(space_id),
+            "capsule_node_path": capsule_path,
+            "editable": editable,
+            "graph_target": target,
+        }
+
+    def _parse_capsule_target(self, value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                raise ValueError("graph_target must be an object or JSON object string")
+        if not isinstance(value, dict):
+            raise ValueError("graph_target is required")
+        # Older callers may use node_space_id; normalize it at the boundary.
+        if "node_space" not in value and "node_space_id" in value:
+            value = dict(value)
+            value["node_space"] = value.get("node_space_id")
+        required = ("owner_guid", "owner_type", "node_space", "capsule_node_path", "asset_id", "asset_version")
+        missing = [key for key in required if key not in value]
+        if missing:
+            raise ValueError("graph_target is missing: " + ", ".join(missing))
+        owner_type = str(value.get("owner_type", "")).lower()
+        if owner_type not in ("object", "tag"):
+            raise ValueError("graph_target.owner_type must be object or tag")
+        return {key: str(value.get(key, "")) for key in required}
+
+    def _resolve_capsule_target(self, doc, target_value, require_editable=False):
+        target = self._parse_capsule_target(target_value)
+        found = None
+        found_type = None
+        hierarchy_path = None
+        nimbus = None
+        for owner, owner_type, path in self._iter_capsule_owners(doc):
+            if owner_type != target["owner_type"]:
+                continue
+            try:
+                candidate = owner.GetNimbusRef(maxon.Id(target["node_space"]))
+            except Exception:
+                candidate = None
+            if candidate is not None and self._capsule_owner_guid(owner, candidate) == target["owner_guid"]:
+                found, found_type, hierarchy_path, nimbus = owner, owner_type, path, candidate
+                break
+        if found is None:
+            raise LookupError("target_not_found: Capsule owner no longer exists")
+        if nimbus is None:
+            raise LookupError("graph_not_exposed: Target owner does not expose the requested NodeSpace")
+        base_graph = nimbus.GetGraph()
+        if base_graph is None:
+            raise LookupError("graph_not_exposed: Target Nimbus graph is unavailable")
+        current_path = target["capsule_node_path"]
+        if current_path:
+            try:
+                target_node = base_graph.GetNode(maxon.NodePath(current_path))
+                asset_id_at_path, _version, _repository, _status = self._capsule_asset_identity(
+                    base_graph, current_path
+                )
+                leaf_id = current_path.rsplit("/", 1)[-1]
+                if (
+                    not target_node
+                    or target_node.GetKind() == maxon.NODE_KIND.NONE
+                    or (not asset_id_at_path and "@" not in leaf_id)
+                ):
+                    raise LookupError()
+            except Exception:
+                raise RuntimeError("target_changed: Capsule NodePath no longer identifies an exposed inner graph")
+        else:
+            owner_path = self._capsule_node_path(found, nimbus, base_graph)
+            if owner_path:
+                raise RuntimeError("target_changed: Owner graph now resolves to a different Capsule path")
+        asset_id, asset_version, _asset_repository, _identity_status = self._capsule_asset_identity(base_graph, current_path)
+        changed = (
+            current_path != target["capsule_node_path"]
+            or (target["asset_id"] and asset_id and asset_id != target["asset_id"])
+            or (target["asset_version"] and asset_version and asset_version != target["asset_version"])
+        )
+        if changed:
+            raise RuntimeError("target_changed: Capsule path or asset identity changed")
+        graph = base_graph
+        if current_path:
+            try:
+                include_all = maxon.NodeSystemManagerInterface.FILTER.INCLUDE_ALL
+                if isinstance(include_all, tuple):
+                    include_all = include_all[0]
+                graph = base_graph.CreateView(include_all, maxon.NodePath(current_path))
+                if graph is None:
+                    raise RuntimeError("CreateView returned no graph")
+            except Exception as exc:
+                raise LookupError("graph_not_exposed: Capsule scoped graph view is unavailable: " + str(exc))
+        editable = self._capsule_is_editable(found, graph)
+        if require_editable and not editable:
+            if self._capsule_is_locked(found):
+                raise PermissionError("locked_capsule: Target Capsule owner layer is locked")
+            raise PermissionError("readonly_capsule: Target Capsule instance is not editable")
+        return {
+            "target": target,
+            "owner": found,
+            "owner_type": found_type,
+            "hierarchy_path": hierarchy_path,
+            "nimbus": nimbus,
+            "base_graph": base_graph,
+            "graph": graph,
+            "editable": editable,
+        }
+
+    def _capsule_error_from_exception(self, exc, fallback="capsule_error"):
+        text = str(exc)
+        known = (
+            "target_not_found", "graph_not_exposed", "target_changed",
+            "readonly_capsule", "locked_capsule", "shared_asset_write_forbidden",
+            "path_outside_target_graph",
+        )
+        for code in known:
+            if text.startswith(code + ":"):
+                return self._scene_nodes_error(text.split(":", 1)[1].strip(), code)
+        return self._scene_nodes_error(text, fallback)
+
+    def _inspect_capsule_instances_main(self, command, cancel_token):
+        if cancel_token.get("cancelled"):
+            return self._scene_nodes_error("Request cancelled", "request_cancelled")
+        doc = c4d.documents.GetActiveDocument()
+        limit = max(1, min(int(command.get("limit", 500)), 5000))
+        owner_filter = str(command.get("owner_guid", ""))
+        space_filter = str(command.get("node_space", ""))
+        editable_only = bool(command.get("editable_only", False))
+        entries = []
+        total = 0
+        for owner, owner_type, path in self._iter_capsule_owners(doc):
+            if cancel_token.get("cancelled"):
+                break
+            try:
+                refs = owner.GetAllNimbusRefs() or []
+            except Exception:
+                refs = []
+            for space_id, nimbus in refs:
+                owner_guid = self._capsule_owner_guid(owner, nimbus)
+                if owner_filter and owner_guid != owner_filter:
+                    continue
+                if space_filter and str(space_id) != space_filter:
+                    continue
+                base_path = self._capsule_node_path(owner, nimbus, nimbus.GetGraph())
+                capsule_paths = [base_path]
+                capsule_paths.extend(self._capsule_inner_paths(nimbus.GetGraph(), base_path))
+                seen_paths = set()
+                for capsule_path in capsule_paths:
+                    if capsule_path in seen_paths:
+                        continue
+                    seen_paths.add(capsule_path)
+                    try:
+                        entry = self._capsule_entry(
+                            owner, owner_type, path, space_id, nimbus, capsule_path
+                        )
+                        if capsule_path != base_path:
+                            entry["hierarchy_path"] = path + "#" + capsule_path
+                    except Exception as exc:
+                        entry = {
+                            "owner_guid": owner_guid,
+                            "owner_type": owner_type,
+                            "hierarchy_path": path,
+                            "node_space": str(space_id),
+                            "capsule_node_path": capsule_path,
+                            "inspect_error": str(exc),
+                        }
+                    if editable_only and not entry.get("editable", False):
+                        continue
+                    total += 1
+                    if len(entries) < limit:
+                        entries.append(entry)
+        result = {
+            "success": True,
+            "instances": entries,
+            "count": len(entries),
+            "total_graph_count": total,
+            "truncated": total > len(entries),
+            "cancelled": bool(cancel_token.get("cancelled")),
+        }
+        max_bytes = max(4096, min(int(command.get("max_bytes", 2000000)), 16000000))
+        while result["instances"] and len(json.dumps(result, ensure_ascii=True)) > max_bytes:
+            result["instances"].pop()
+            result["count"] = len(result["instances"])
+            result["truncated"] = True
+            result["truncation_reason"] = "max_bytes"
+        return result
+
+    def handle_inspect_capsule_instances(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._inspect_capsule_instances_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _capsule_graph_payload(self, graph, command):
+        max_nodes = max(1, min(int(command.get("max_nodes", command.get("limit", 200))), 2000))
+        max_ports = max(1, min(int(command.get("max_ports", 2000)), 10000))
+        max_connections = max(1, min(int(command.get("max_connections", 2000)), 10000))
+        filters = set(command.get("node_paths") or ([command["node_path"]] if command.get("node_path") else []))
+        nodes = [node for node in self._all_graph_nodes(graph) if not filters or self._node_path(node) in filters]
+        truncated = len(nodes) > max_nodes
+        selected = nodes[:max_nodes]
+        data = []
+        port_count = 0
+        for node in selected:
+            info = self._node_info(node, bool(command.get("include_ports", True)), bool(command.get("include_values", True)))
+            ports = info.get("inputs", []) + info.get("outputs", [])
+            if port_count + len(ports) > max_ports:
+                allowance = max(0, max_ports - port_count)
+                input_count = min(len(info.get("inputs", [])), allowance)
+                combined = ports[:allowance]
+                info["inputs"] = combined[:input_count]
+                info["outputs"] = combined[input_count:]
+                truncated = True
+            port_count += len(info.get("inputs", [])) + len(info.get("outputs", []))
+            data.append(info)
+            if port_count >= max_ports:
+                truncated = truncated or len(data) < len(selected)
+                break
+        connections, connection_truncated = self._graph_connections(selected, max_connections) if command.get("include_connections", True) else ([], False)
+        result = {
+            "success": True,
+            "graph_exists": True,
+            "modification_stamp": str(graph.GetModificationStamp()),
+            "nodes": data,
+            "connections": connections,
+            "truncated": bool(truncated or connection_truncated),
+            "limits": {"max_nodes": max_nodes, "max_ports": max_ports, "max_connections": max_connections},
+        }
+        max_bytes = max(4096, min(int(command.get("max_bytes", 2000000)), 16000000))
+        if len(json.dumps(result, ensure_ascii=True)) > max_bytes:
+            result["connections"] = []
+            result["truncated"] = True
+            result["truncation_reason"] = "max_bytes"
+            for node in result["nodes"]:
+                for port in node.get("inputs", []):
+                    port.pop("value", None)
+            while result["nodes"] and len(json.dumps(result, ensure_ascii=True)) > max_bytes:
+                result["nodes"].pop()
+        return result
+
+    def _inspect_capsule_graph_main(self, command, cancel_token):
+        if cancel_token.get("cancelled"):
+            return self._scene_nodes_error("Request cancelled", "request_cancelled")
+        resolved = None
+        try:
+            resolved = self._resolve_capsule_target(c4d.documents.GetActiveDocument(), command.get("graph_target"))
+            result = self._capsule_graph_payload(resolved["graph"], command)
+            result["graph_target"] = resolved["target"]
+            result["node_space"] = resolved["target"]["node_space"]
+            result["editable"] = resolved["editable"]
+            self._atomic_debug_write(command.get("debug_path"), result)
+            return result
+        except Exception as exc:
+            return self._capsule_error_from_exception(exc, "capsule_inspect_failed")
+        finally:
+            resolved = None
+
+    def handle_inspect_capsule_graph(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._inspect_capsule_graph_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _focus_resolved_capsule(self, doc, resolved):
+        owner = resolved["owner"]
+        owner_type = resolved["owner_type"]
+        editor_opened = None
+        target_open_requested = False
+        fallback_requested = False
+        errors = []
+        try:
+            if owner_type == "tag":
+                host = owner.GetObject()
+                if host is not None:
+                    doc.SetActiveObject(host, c4d.SELECTION_NEW)
+                doc.SetActiveTag(owner, c4d.SELECTION_NEW)
+            else:
+                doc.SetActiveObject(owner, c4d.SELECTION_NEW)
+        except Exception as exc:
+            errors.append("selection: " + str(exc))
+        try:
+            path = resolved["target"]["capsule_node_path"]
+            resolved["nimbus"].OpenInEditor(maxon.NodePath(path) if path else maxon.NodePath())
+            target_open_requested = True
+        except Exception as exc:
+            errors.append("OpenInEditor: " + str(exc))
+            try:
+                c4d.CallCommand(maxon.neutron.ID_NBO_SCENEEDITOR)
+                fallback_requested = True
+            except Exception as fallback_exc:
+                errors.append("CallCommand: " + str(fallback_exc))
+        c4d.EventAdd()
+        try:
+            selected = doc.GetActiveTag() == owner if owner_type == "tag" else doc.GetActiveObject() == owner
+        except Exception:
+            selected = False
+        # GetActiveNodeSpaceId() describes the globally active node space and
+        # does not change when OpenInEditor targets a specific Nimbus graph.
+        # It therefore cannot verify this editor request.
+        node_space_matches = None
+        # The Python API exposes neither the active graph nor the editor's
+        # instance context. Owner and node-space verification are therefore
+        # the strongest truthful result available in 2026.3.1.
+        graph_verified = False
+        if target_open_requested:
+            status = "best_effort"
+        elif fallback_requested:
+            status = "partial"
+        else:
+            status = "failed"
+        return {
+            "focus_status": status,
+            "owner_selected": bool(selected),
+            "editor_opened": editor_opened,
+            "node_space_matches": node_space_matches,
+            "graph_verified": graph_verified,
+            "focus_error": "; ".join(errors) if errors else None,
+        }
+
+    def _focus_capsule_graph_main(self, command, cancel_token):
+        if cancel_token.get("cancelled"):
+            return self._scene_nodes_error("Request cancelled", "request_cancelled")
+        resolved = None
+        try:
+            resolved = self._resolve_capsule_target(c4d.documents.GetActiveDocument(), command.get("graph_target"))
+            result = {"success": True, "graph_target": resolved["target"]}
+            result.update(self._focus_resolved_capsule(c4d.documents.GetActiveDocument(), resolved))
+            return result
+        except Exception as exc:
+            return self._capsule_error_from_exception(exc, "capsule_focus_failed")
+        finally:
+            resolved = None
+
+    def handle_focus_capsule_graph(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._focus_capsule_graph_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _search_capsule_assets_main(self, command, cancel_token):
+        result = self._search_scene_node_assets_main(command, cancel_token)
+        if result.get("success"):
+            for asset in result.get("assets", []):
+                asset["asset_kind"] = "capsule_or_node_template"
+                asset["applicable_node_space"] = asset.get("node_space", self._SCENE_NODES_SPACE)
+        return result
+
+    def handle_search_capsule_assets(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._search_capsule_assets_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _describe_capsule_asset_main(self, command, cancel_token):
+        asset_id = command.get("asset_id")
+        if not asset_id:
+            return self._scene_nodes_error("asset_id is required", "invalid_request")
+        if cancel_token.get("cancelled"):
+            return self._scene_nodes_error("Request cancelled", "request_cancelled")
+        temp_doc = c4d.documents.BaseDocument()
+        graph = view = node = transaction = None
+        try:
+            graph = self._get_scene_nodes_graph(temp_doc, True)
+            transaction = graph.BeginTransaction()
+            node = graph.AddChild(maxon.Id(), maxon.Id(str(asset_id)))
+            node_path = self._node_path(node)
+            include_all = maxon.NodeSystemManagerInterface.FILTER.INCLUDE_ALL
+            if isinstance(include_all, tuple):
+                include_all = include_all[0]
+            view = graph.CreateView(include_all, maxon.NodePath(node_path))
+            inner_nodes = list(view.GetRoot().GetChildren(mask=maxon.NODE_KIND.NODE))
+            resolved_id, resolved_version, repository, identity_status = self._capsule_asset_identity(graph, node_path)
+            requested_version = str(command.get("asset_version") or "")
+            result = {
+                "success": True,
+                "asset_id": str(asset_id),
+                "resolved_asset_id": resolved_id,
+                "resolved_asset_version": resolved_version,
+                "asset_repository": repository,
+                "asset_identity_status": identity_status,
+                "node": self._node_info(node, True, True),
+                "internal_graph_visible": bool(inner_nodes),
+                "internal_node_count": len(inner_nodes),
+                "instance_editable": not bool(view.IsReadOnly()),
+                "write_mode": "instance_only",
+                "description_scope": "temporary_document",
+                "version_verified": bool(
+                    requested_version
+                    and resolved_version
+                    and requested_version == resolved_version
+                ),
+            }
+            if requested_version:
+                result["requested_asset_version"] = requested_version
+                if not result["version_verified"]:
+                    result["version_note"] = (
+                        "The Python NodeTemplate instantiation API resolves the installed "
+                        "asset and cannot force an arbitrary repository version"
+                    )
+            transaction.Rollback()
+            transaction = None
+            return result
+        except Exception as exc:
+            return self._scene_nodes_error(
+                str(exc), "asset_description_failed", asset_id=str(asset_id)
+            )
+        finally:
+            if transaction is not None:
+                try:
+                    transaction.Rollback()
+                except Exception:
+                    pass
+            transaction = node = view = graph = None
+            c4d.documents.KillDocument(temp_doc)
+            temp_doc = None
+
+    def handle_describe_capsule_asset(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._describe_capsule_asset_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _path_is_within_capsule_graph(self, graph, path, capsule_path):
+        try:
+            node = graph.GetNode(maxon.NodePath(str(path)))
+            if not node or node.GetKind() == maxon.NODE_KIND.NONE:
+                return False
+        except Exception:
+            return False
+        # GraphNode handles are graph-local. GetNode succeeding against this
+        # exact Nimbus graph is the authoritative containment check; a path
+        # copied from another owner's graph cannot resolve here.
+        return True
+
+    def _validate_capsule_operation_paths(self, graph, operation, capsule_path):
+        path_keys = {
+            "path", "node", "node_path", "node_ref", "port_path",
+            "source", "source_node", "source_port",
+            "target", "target_node", "target_port",
+        }
+
+        def visit(value, key=None):
+            if isinstance(value, dict):
+                for child_key, child in value.items():
+                    visit(child, child_key)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child, key)
+            elif key in path_keys and isinstance(value, str) and value and not value.startswith("$op:"):
+                # Compact port ids use the `port` key. Values under these keys
+                # are absolute NodePaths and must resolve inside this scoped
+                # graph view.
+                try:
+                    node = graph.GetNode(maxon.NodePath(value))
+                    exists = bool(node and node.GetKind() != maxon.NODE_KIND.NONE)
+                except Exception:
+                    exists = False
+                if not exists or not self._path_is_within_capsule_graph(graph, value, capsule_path):
+                    raise ValueError("path_outside_target_graph: NodePath is outside the target Capsule graph")
+
+        visit(operation)
+
+    def _edit_capsule_graph_main(self, command, cancel_token):
+        if str(command.get("write_mode", "instance_only")) != "instance_only":
+            return self._scene_nodes_error("Only instance_only writes are supported", "shared_asset_write_forbidden")
+        operations = command.get("operations") or []
+        if not isinstance(operations, list) or not operations:
+            return self._scene_nodes_error("operations must be a non-empty array", "invalid_request")
+        doc = c4d.documents.GetActiveDocument()
+        resolved = None
+        states = {}
+        try:
+            resolved = self._resolve_capsule_target(doc, command.get("graph_target"), True)
+            graph = resolved["graph"]
+            focus = {"focus_status": "skipped", "owner_selected": False, "editor_opened": False, "node_space_matches": False, "graph_verified": False}
+            if command.get("focus_editor", True):
+                focus = self._focus_resolved_capsule(doc, resolved)
+            results = []
+            affected_paths = set()
+            success_count = 0
+            seen_ids = set()
+
+            def record(item):
+                try:
+                    item["modification_stamp"] = str(graph.GetModificationStamp())
+                except Exception:
+                    pass
+                results.append(item)
+                states[item["op_id"]] = item
+
+            for index, operation in enumerate(operations):
+                op_id = str(operation.get("op_id") or "op_" + str(index + 1)) if isinstance(operation, dict) else "op_" + str(index + 1)
+                if op_id in seen_ids:
+                    record({"op_id": op_id, "status": "error", "error_code": "duplicate_op_id", "error": "op_id must be unique"})
+                    continue
+                seen_ids.add(op_id)
+                if cancel_token.get("cancelled"):
+                    record({"op_id": op_id, "status": "skipped", "error_code": "request_cancelled", "error": "Request timed out; remaining operations were not executed"})
+                    continue
+                if not isinstance(operation, dict):
+                    record({"op_id": op_id, "status": "error", "error_code": "invalid_operation", "error": "Operation must be an object"})
+                    continue
+                failed = [dep for dep in self._operation_dependency(operation) if dep not in states or states[dep].get("status") != "success"]
+                if failed:
+                    record({"op_id": op_id, "status": "dependency_failed", "error_code": "dependency_failed", "dependencies": failed})
+                    continue
+                transaction = None
+                try:
+                    # Re-resolve immediately before every transaction so a
+                    # changed owner, graph, Capsule path or version cannot be
+                    # written through a stale request-local reference.
+                    current = self._resolve_capsule_target(doc, resolved["target"], True)
+                    graph = current["graph"]
+                    self._validate_capsule_operation_paths(graph, operation, current["target"]["capsule_node_path"])
+                    undo_mode = maxon.nodes.UNDO_MODE.START if success_count == 0 else maxon.nodes.UNDO_MODE.ADD
+                    transaction = graph.BeginTransaction(self._transaction_user_data(undo_mode))
+                    node, details = self._apply_scene_node_operation(graph, operation, states)
+                    transaction.Commit()
+                    transaction = None
+                    item = {"op_id": op_id, "type": self._operation_kind(operation), "status": "success"}
+                    item.update(details)
+                    if node is not None:
+                        affected_paths.add(self._node_path(node))
+                    success_count += 1
+                except KeyError as exc:
+                    item = {"op_id": op_id, "status": "dependency_failed", "error_code": "dependency_failed", "dependencies": [str(exc).strip("'")]}
+                except Exception as exc:
+                    if transaction is not None:
+                        try:
+                            transaction.Rollback()
+                        except Exception:
+                            pass
+                    text = str(exc)
+                    code = "operation_failed"
+                    for known in ("target_changed", "readonly_capsule", "path_outside_target_graph", "graph_not_exposed", "target_not_found"):
+                        if text.startswith(known + ":"):
+                            code = known
+                            text = text.split(":", 1)[1].strip()
+                            break
+                    item = {"op_id": op_id, "type": self._operation_kind(operation), "status": "error", "error_code": code, "error": text}
+                record(item)
+            layout = {"layout_status": "skipped", "layout_node_count": 0}
+            if command.get("layout_after_batch", True) and success_count and not cancel_token.get("cancelled"):
+                layout = self._layout_scene_nodes(graph, str(command.get("layout", "component")).lower(), affected_paths, maxon.nodes.UNDO_MODE.ADD)
+            c4d.EventAdd()
+            result = {
+                "success": success_count > 0 and not cancel_token.get("cancelled"),
+                "partial_success": 0 < success_count < len(operations),
+                "operation_count": len(operations),
+                "success_count": success_count,
+                "operations": results,
+                "graph_target": resolved["target"],
+                "write_mode": "instance_only",
+                "modification_stamp": str(graph.GetModificationStamp()),
+            }
+            result.update(focus)
+            result.update(layout)
+            try:
+                self._atomic_debug_write(command.get("debug_path"), result)
+            except Exception as exc:
+                result["debug_error"] = str(exc)
+            return result
+        except Exception as exc:
+            return self._capsule_error_from_exception(exc, "capsule_edit_failed")
+        finally:
+            states.clear()
+            resolved = None
+
+    def handle_edit_capsule_graph(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._edit_capsule_graph_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    def _layout_capsule_graph_main(self, command, cancel_token):
+        if cancel_token.get("cancelled"):
+            return self._scene_nodes_error("Request cancelled", "request_cancelled")
+        scope = str(command.get("scope", "component")).lower()
+        if scope == "all" and command.get("scope") != "all":
+            return self._scene_nodes_error("Full graph layout must be explicitly requested", "explicit_all_required")
+        resolved = None
+        try:
+            resolved = self._resolve_capsule_target(c4d.documents.GetActiveDocument(), command.get("graph_target"), True)
+            seeds = command.get("node_paths") or ([command["node_path"]] if command.get("node_path") else [])
+            for path in seeds:
+                if not self._path_is_within_capsule_graph(resolved["graph"], path, resolved["target"]["capsule_node_path"]):
+                    return self._scene_nodes_error("NodePath is outside the target Capsule graph", "path_outside_target_graph")
+            result = {"success": True, "graph_target": resolved["target"]}
+            result.update(self._layout_scene_nodes(resolved["graph"], scope, seeds, maxon.nodes.UNDO_MODE.START))
+            c4d.EventAdd()
+            return result
+        except Exception as exc:
+            return self._capsule_error_from_exception(exc, "capsule_layout_failed")
+        finally:
+            resolved = None
+
+    def handle_layout_capsule_graph(self, command):
+        token = {"cancelled": False}
+        return self.execute_on_main_thread(self._layout_capsule_graph_main, (command, token), _timeout=float(command.get("timeout", 60)), _cancel_token=token)
+
+    @main_thread_handler
     def handle_render_frame(
         self, command
     ):  # Renamed from handle_render_to_file to match command key
@@ -6721,6 +8452,7 @@ class C4DSocketServer(threading.Thread):
             else:  # Fallback for unexpected scenarios
                 return {"error": "Unknown error during render frame execution."}
 
+    @main_thread_handler
     def handle_apply_shader(self, command):
         """Handle apply_shader command with improved Redshift/Fresnel support and context."""
         doc = c4d.documents.GetActiveDocument()
@@ -7048,17 +8780,115 @@ class C4DSocketServer(threading.Thread):
             }
 
 
-class SocketServerDialog(gui.GeDialog):
-    """GUI Dialog to control the server and display logs."""
+class AgentServiceController:
+    """Own the Agent service independently from the optional dialog."""
+
+    MAX_LOG_ENTRIES = 2000
 
     def __init__(self):
-        super(SocketServerDialog, self).__init__()
         self.server = None
-        self.msg_queue = queue.Queue()  # Thread-safe queue
-        self.SetTimer(100)  # Update UI at 10 Hz
+        self.msg_queue = queue.Queue()
+        self.log_history = []
+        self.log_revision = 0
+        self.server_status = "Offline"
+        preferences = c4d.plugins.GetWorldPluginData(PLUGIN_ID)
+        self.auto_lifecycle_enabled = (
+            preferences.GetBool(PREF_AUTO_LIFECYCLE, True)
+            if preferences is not None
+            else True
+        )
+
+    def set_auto_lifecycle_enabled(self, enabled):
+        """Persist whether the service should start with Cinema 4D."""
+        self.auto_lifecycle_enabled = bool(enabled)
+        preferences = c4d.BaseContainer()
+        preferences.SetBool(PREF_AUTO_LIFECYCLE, self.auto_lifecycle_enabled)
+        return c4d.plugins.SetWorldPluginData(PLUGIN_ID, preferences, True)
+
+    def start_server(self):
+        """Start the socket server unless it is already running or starting."""
+        if self.server and (self.server.running or self.server.is_alive()):
+            return
+
+        self.server = C4DSocketServer(msg_queue=self.msg_queue)
+        self.server_status = "Starting"
+        self.server.start()
+
+    def stop_server(self):
+        """Stop the socket server without depending on dialog state."""
+        if self.server:
+            self.server.stop()
+            self.server = None
+        self.server_status = "Offline"
+
+    def sync_status(self):
+        if self.server and self.server.running:
+            self.server_status = "Online"
+        elif self.server and self.server.is_alive():
+            self.server_status = "Starting"
+        else:
+            self.server_status = "Offline"
+
+    def append_log(self, message):
+        self.log_history.append(message)
+        self.log_revision += 1
+        if len(self.log_history) > self.MAX_LOG_ENTRIES:
+            self.log_history = self.log_history[-self.MAX_LOG_ENTRIES :]
+
+    def process_messages(self):
+        """Drain socket messages and execute queued work on C4D's main thread."""
+        while True:
+            try:
+                msg_type, msg_value = self.msg_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            try:
+                if msg_type == "STATUS":
+                    self.server_status = msg_value
+                elif msg_type == "LOG":
+                    self.append_log(msg_value)
+                elif msg_type == "EXEC" and callable(msg_value):
+                    msg_value()
+                else:
+                    self.append_log(
+                        f"[C4D] ## Warning ##: Unknown message type: {msg_type}"
+                    )
+            except Exception as exc:
+                error_msg = f"[**ERROR**] Error processing message: {str(exc)}"
+                self.append_log(error_msg)
+                print(error_msg)
+
+        self.sync_status()
+
+
+class AgentServiceMessagePlugin(c4d.plugins.MessageData):
+    """Keep main-thread dispatch active while the Agent dialog is closed."""
+
+    def __init__(self, controller):
+        super(AgentServiceMessagePlugin, self).__init__()
+        self.controller = controller
+
+    def GetTimer(self):
+        return 100
+
+    def CoreMessage(self, message_id, message):
+        if message_id in (c4d.MSG_TIMER, PLUGIN_ID):
+            self.controller.process_messages()
+        return True
+
+
+class SocketServerDialog(gui.GeDialog):
+    """Optional GUI for observing and manually controlling the service."""
+
+    def __init__(self, controller):
+        super(SocketServerDialog, self).__init__()
+        self.controller = controller
+        self.rendered_log_revision = -1
+        self.SetTimer(100)
 
     def CreateLayout(self):
-        self.SetTitle("Socket Server Control")
+        self.SetTitle("Cinema 4D Agent")
 
         self.status_text = self.AddStaticText(
             1002, c4d.BFH_SCALEFIT, name="Server: Offline"
@@ -7069,6 +8899,14 @@ class SocketServerDialog(gui.GeDialog):
         self.AddButton(1012, c4d.BFH_SCALE, name="Stop Server")
         self.GroupEnd()
 
+        self.AddCheckbox(
+            1013,
+            c4d.BFH_LEFT,
+            initw=0,
+            inith=0,
+            name="Start/stop Server with Cinema 4D",
+        )
+
         self.log_box = self.AddMultiLineEditText(
             1004,
             c4d.BFH_SCALEFIT,
@@ -7077,121 +8915,61 @@ class SocketServerDialog(gui.GeDialog):
             style=c4d.DR_MULTILINE_READONLY,
         )
 
-        self.Enable(1012, False)  # Disable "Stop" button initially
+        self.RefreshFromController(force_logs=True)
         return True
 
     def CoreMessage(self, id, msg):
-        """Handles UI updates and main thread execution triggered by SpecialEventAdd()."""
-        if id == PLUGIN_ID:
-            try:
-                # Process all pending messages in the queue
-                while not self.msg_queue.empty():
-                    try:
-                        # Get next message from queue with timeout to avoid potential deadlocks
-                        msg_type, msg_value = self.msg_queue.get(timeout=0.1)
-
-                        # Process based on message type
-                        if msg_type == "STATUS":
-                            self.UpdateStatusText(msg_value)
-                        elif msg_type == "LOG":
-                            self.AppendLog(msg_value)
-                        elif msg_type == "EXEC":
-                            # Execute function on main thread
-                            if callable(msg_value):
-                                try:
-                                    msg_value()
-                                except Exception as e:
-                                    error_msg = f"[**ERROR**] Error in main thread execution: {str(e)}"
-                                    self.AppendLog(error_msg)
-                                    print(
-                                        error_msg
-                                    )  # Also print to console for debugging
-                            else:
-                                self.AppendLog(
-                                    f"[C4D] ## Warning ##: Non-callable value received: {type(msg_value)}"
-                                )
-                        else:
-                            self.AppendLog(
-                                f"[C4D] ## Warning ##: Unknown message type: {msg_type}"
-                            )
-                    except queue.Empty:
-                        # Queue timeout - break the loop to prevent blocking
-                        break
-                    except Exception as e:
-                        # Handle any other exceptions during message processing
-                        error_msg = f"[**ERROR**] Error processing message: {str(e)}"
-                        self.AppendLog(error_msg)
-                        print(error_msg)  # Also print to console for debugging
-            except Exception as e:
-                # Catch all exceptions to prevent Cinema 4D from crashing
-                error_msg = f"[C4D] Critical error in message processing: {str(e)}"
-                print(error_msg)  # Print to console as UI might be unstable
-                try:
-                    self.AppendLog(error_msg)
-                except:
-                    pass  # Ignore if we can't even log to UI
-
+        self.RefreshFromController()
         return True
 
     def Timer(self, msg):
-        """Periodic UI update in case SpecialEventAdd() missed something."""
-        if self.server:
-            if not self.server.running:  # Detect unexpected crashes
-                self.UpdateStatusText("Offline")
-                self.Enable(1011, True)
-                self.Enable(1012, False)
+        self.RefreshFromController()
         return True
 
-    def UpdateStatusText(self, status):
-        """Update server status UI."""
+    def RefreshFromController(self, force_logs=False):
+        self.controller.sync_status()
+        status = self.controller.server_status
         self.SetString(1002, f"Server: {status}")
         self.Enable(1011, status == "Offline")
-        self.Enable(1012, status == "Online")
-
-    def AppendLog(self, message):
-        """Append log messages to UI."""
-        existing_text = self.GetString(1004)
-        new_text = (existing_text + "\n" + message).strip()
-        self.SetString(1004, new_text)
+        self.Enable(1012, status in ("Online", "Starting"))
+        self.SetBool(1013, self.controller.auto_lifecycle_enabled)
+        log_revision = self.controller.log_revision
+        if force_logs or log_revision != self.rendered_log_revision:
+            self.SetString(1004, "\n".join(self.controller.log_history))
+            self.rendered_log_revision = log_revision
 
     def Command(self, id, msg):
         if id == 1011:  # Start Server button
-            self.StartServer()
+            self.controller.start_server()
+            self.RefreshFromController()
             return True
         elif id == 1012:  # Stop Server button
-            self.StopServer()
+            self.controller.stop_server()
+            self.RefreshFromController()
+            return True
+        elif id == 1013:  # Automatic Cinema 4D lifecycle checkbox
+            self.controller.set_auto_lifecycle_enabled(self.GetBool(1013))
             return True
         return False
-
-    def StartServer(self):
-        """Start the socket server thread."""
-        if not self.server:
-            self.server = C4DSocketServer(msg_queue=self.msg_queue)
-            self.server.start()
-            self.Enable(1011, False)
-            self.Enable(1012, True)
-
-    def StopServer(self):
-        """Stop the socket server."""
-        if self.server:
-            self.server.stop()
-            self.server = None
-            self.Enable(1011, True)
-            self.Enable(1012, False)
 
 
 class SocketServerPlugin(c4d.plugins.CommandData):
     """Cinema 4D Plugin Wrapper"""
 
     PLUGIN_ID = 1057843
-    PLUGIN_NAME = "Socket Server Plugin"
+    PLUGIN_NAME = "Cinema 4D Agent"
 
-    def __init__(self):
+    def __init__(self, controller):
+        self.controller = controller
         self.dialog = None
 
     def Execute(self, doc):
+        return self.OpenDialog()
+
+    def OpenDialog(self):
+        """Open the control panel without changing service state."""
         if self.dialog is None:
-            self.dialog = SocketServerDialog()
+            self.dialog = SocketServerDialog(self.controller)
         return self.dialog.Open(
             dlgtype=c4d.DLG_TYPE_ASYNC,
             pluginid=self.PLUGIN_ID,
@@ -7203,12 +8981,60 @@ class SocketServerPlugin(c4d.plugins.CommandData):
         return c4d.CMD_ENABLED
 
 
+def load_plugin_icon():
+    """Load the command icon without preventing plugin registration on failure."""
+    icon_path = os.path.join(os.path.dirname(__file__), "res", "icon.png")
+    if not os.path.isfile(icon_path):
+        print(f"[C4D MCP] Plugin icon not found: {icon_path}")
+        return None
+
+    try:
+        icon = c4d.bitmaps.BaseBitmap()
+        result = icon.InitWith(icon_path)
+        result_code = result[0] if isinstance(result, tuple) else result
+        if result_code != c4d.IMAGERESULT_OK:
+            print(f"[C4D MCP] Failed to load plugin icon: {result_code}")
+            return None
+        return icon
+    except Exception as exc:
+        print(f"[C4D MCP] Failed to load plugin icon: {exc}")
+        return None
+
+
+service_controller = AgentServiceController()
+service_message_plugin = AgentServiceMessagePlugin(service_controller)
+plugin_instance = SocketServerPlugin(service_controller)
+
+
+def PluginMessage(message_id, data):
+    """Start and stop the Agent service with the Cinema 4D application."""
+    if message_id in (c4d.C4DPL_STARTACTIVITY, c4d.C4DPL_PROGRAM_STARTED):
+        # The unified launcher sets this only for the Cinema 4D child process.
+        # It lets a one-click launch start the socket even when the persisted
+        # dialog checkbox is disabled, without changing that user preference.
+        launcher_requested_start = os.environ.get(
+            "C4D_AGENT_FORCE_START", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if service_controller.auto_lifecycle_enabled or launcher_requested_start:
+            service_controller.start_server()
+    elif message_id == c4d.C4DPL_ENDPROGRAM:
+        service_controller.stop_server()
+    return True
+
+
 if __name__ == "__main__":
+    plugin_icon = load_plugin_icon()
+    c4d.plugins.RegisterMessagePlugin(
+        SERVICE_PLUGIN_ID,
+        "Cinema 4D Agent Service",
+        0,
+        service_message_plugin,
+    )
     c4d.plugins.RegisterCommandPlugin(
         SocketServerPlugin.PLUGIN_ID,
         SocketServerPlugin.PLUGIN_NAME,
         0,
+        plugin_icon,
         None,
-        None,
-        SocketServerPlugin(),
+        plugin_instance,
     )

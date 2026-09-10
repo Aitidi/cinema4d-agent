@@ -1,8 +1,10 @@
 """Cinema 4D MCP Server."""
 
+import asyncio
 import socket
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -20,28 +22,39 @@ class C4DConnection:
     connected: bool = False
 
 
-# Asynchronous context manager for Cinema 4D connection
 @asynccontextmanager
 async def c4d_connection_context():
-    """Asynchronous context manager for Cinema 4D connection."""
+    """Connect without blocking the MCP event loop; always release the socket."""
     connection = C4DConnection()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    connection.sock = sock
     try:
-        # Initialize connection to Cinema 4D
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((C4D_HOST, C4D_PORT))
-        connection.sock = sock
-        connection.connected = True
-        logger.info(f"✅ Connected to Cinema 4D at {C4D_HOST}:{C4D_PORT}")
-        yield connection  # Yield the connection
-    except Exception as e:
-        logger.error(f"❌ Failed to connect to Cinema 4D: {str(e)}")
-        connection.connected = False  # Ensure connection is marked as not connected
-        yield connection  # Still yield the connection object
+        sock.settimeout(5)
+        try:
+            await asyncio.to_thread(sock.connect, (C4D_HOST, C4D_PORT))
+            connection.connected = True
+            logger.info(f"Connected to Cinema 4D at {C4D_HOST}:{C4D_PORT}")
+        except OSError as exc:
+            logger.error(f"Failed to connect to Cinema 4D: {exc}")
+        yield connection
     finally:
-        # Clean up on server shutdown
-        if connection.sock:
-            connection.sock.close()
-            logger.info("🔌 Disconnected from Cinema 4D")
+        connection.connected = False
+        sock.close()
+
+
+async def async_send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep blocking socket I/O off the event loop, including for legacy tools."""
+    try:
+        return await asyncio.to_thread(send_to_c4d, connection, command)
+    except asyncio.CancelledError:
+        # Wake the receiving worker before the context closes its socket.
+        # This interrupts transport I/O, not an already executing C4D command.
+        if connection.sock is not None:
+            try:
+                connection.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        raise
 
 
 def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str, Any]:
@@ -59,20 +72,31 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
         "snapshot_scene",
         "apply_mograph_fields",
         "execute_python",
+        "inspect_scene_nodes_graph",
+        "search_scene_node_assets",
+        "describe_scene_node_asset",
+        "edit_scene_nodes_graph",
+        "layout_scene_nodes_graph",
+        "inspect_capsule_instances",
+        "inspect_capsule_graph",
+        "focus_capsule_graph",
+        "search_capsule_assets",
+        "describe_capsule_asset",
+        "edit_capsule_graph",
+        "layout_capsule_graph",
     ]:
-        timeout = 120  # 2 minutes for render and heavy script operations
+        timeout = 185 if command_type == "render_frame" else 120
         logger.info(f"Using extended timeout ({timeout}s) for {command_type}")
     else:
         timeout = 20  # Default timeout for regular operations
 
     try:
+        connection.sock.settimeout(timeout)
         # Convert command to JSON and send it
+        command = {**command, "_deadline": time.time() + timeout - 1}
         command_json = json.dumps(command) + "\n"  # Add newline as message delimiter
         logger.debug(f"Sending command: {command_type}")
         connection.sock.sendall(command_json.encode("utf-8"))
-
-        # Set socket timeout
-        connection.sock.settimeout(timeout)
 
         # Receive response
         response_data = b""
@@ -86,6 +110,18 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
             "snapshot_scene",
             "apply_mograph_fields",
             "execute_python",
+            "inspect_scene_nodes_graph",
+            "search_scene_node_assets",
+            "describe_scene_node_asset",
+            "edit_scene_nodes_graph",
+            "layout_scene_nodes_graph",
+            "inspect_capsule_instances",
+            "inspect_capsule_graph",
+            "focus_capsule_graph",
+            "search_capsule_assets",
+            "describe_capsule_asset",
+            "edit_capsule_graph",
+            "layout_capsule_graph",
         ]:
             logger.info(
                 f"Waiting for response from {command_type} (timeout: {timeout}s)"
@@ -424,7 +460,7 @@ async def get_scene_info(ctx: Context) -> str:
         if not connection.connected:
             return "❌ Not connected to Cinema 4D"
 
-        response = send_to_c4d(connection, {"command": "get_scene_info"})
+        response = await async_send_to_c4d(connection, {"command": "get_scene_info"})
 
         if "error" in response:
             return f"❌ Error: {response['error']}"
@@ -478,7 +514,7 @@ async def add_primitive(
             command["size"] = size
 
         # Send command to Cinema 4D
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "add_primitive")
 
 
@@ -498,7 +534,7 @@ async def modify_object(
             return "❌ Not connected to Cinema 4D"
 
         # Send command to Cinema 4D
-        response = send_to_c4d(
+        response = await async_send_to_c4d(
             connection,
             {
                 "command": "modify_object",
@@ -521,7 +557,7 @@ async def list_objects(ctx: Context) -> str:
         if not connection.connected:
             return "❌ Not connected to Cinema 4D"
 
-        response = send_to_c4d(connection, {"command": "list_objects"})
+        response = await async_send_to_c4d(connection, {"command": "list_objects"})
         return format_c4d_response(response, "list_objects")
 
 
@@ -553,7 +589,7 @@ async def create_material(
             command["properties"] = properties
 
         # Send command to Cinema 4D
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "create_material")
 
 
@@ -571,7 +607,7 @@ async def apply_material(material_name: str, object_name: str, ctx: Context) -> 
             return "❌ Not connected to Cinema 4D"
 
         # Send command to Cinema 4D
-        response = send_to_c4d(
+        response = await async_send_to_c4d(
             connection,
             {
                 "command": "apply_material",
@@ -624,7 +660,7 @@ async def inspect_redshift_materials(
         if material_name:
             command["material_name"] = material_name
 
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
 
         if "error" in response:
             return f"❌ Error: {response['error']}"
@@ -662,7 +698,7 @@ async def render_frame(
             command["height"] = height
 
         # Send command to Cinema 4D
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "render_frame")
 
 
@@ -684,7 +720,7 @@ async def set_keyframe(
             return "❌ Not connected to Cinema 4D"
 
         # Send command to Cinema 4D
-        response = send_to_c4d(
+        response = await async_send_to_c4d(
             connection,
             {
                 "command": "set_keyframe",
@@ -716,7 +752,7 @@ async def save_scene(file_path: Optional[str] = None, ctx: Context = None) -> st
             command["file_path"] = file_path
 
         # Send command to Cinema 4D
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "save_scene")
 
 
@@ -733,7 +769,7 @@ async def load_scene(file_path: str, ctx: Context) -> str:
             return "❌ Not connected to Cinema 4D"
 
         # Send command to Cinema 4D
-        response = send_to_c4d(
+        response = await async_send_to_c4d(
             connection, {"command": "load_scene", "file_path": file_path}
         )
         return format_c4d_response(response, "load_scene")
@@ -759,7 +795,7 @@ async def create_mograph_cloner(
         if name:
             command["cloner_name"] = name
 
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "create_mograph_cloner")
 
 
@@ -790,7 +826,7 @@ async def add_effector(
         if target:
             command["cloner_name"] = target
 
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "add_effector")
 
 
@@ -832,7 +868,7 @@ async def apply_mograph_fields(
         logger.info(f"Sending apply_mograph_fields command: {command}")
 
         # Send the command to Cinema 4D
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
 
         if "error" in response:
             logger.error(f"Error applying field: {response['error']}")
@@ -851,7 +887,7 @@ async def create_soft_body(object_name: str, ctx: Context = None) -> str:
         if not connection.connected:
             return "❌ Not connected to Cinema 4D"
 
-        response = send_to_c4d(
+        response = await async_send_to_c4d(
             connection, {"command": "create_soft_body", "object_name": object_name}
         )
         return format_c4d_response(response, "create_soft_body")
@@ -872,7 +908,7 @@ async def apply_dynamics(
         if not connection.connected:
             return "❌ Not connected to Cinema 4D"
 
-        response = send_to_c4d(
+        response = await async_send_to_c4d(
             connection,
             {
                 "command": "apply_dynamics",
@@ -903,7 +939,7 @@ async def create_abstract_shape(
         if name:
             command["object_name"] = name
 
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "create_abstract_shape")
 
 
@@ -938,7 +974,7 @@ async def create_camera(
         if properties:
             command["properties"] = properties
 
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "create_camera")
 
 
@@ -962,7 +998,7 @@ async def create_light(
         if name:
             command["object_name"] = name
 
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "create_light")
 
 
@@ -993,7 +1029,7 @@ async def apply_shader(
         if object_name:
             command["object_name"] = object_name
 
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "apply_shader")
 
 
@@ -1060,7 +1096,7 @@ async def animate_camera(
                 command["frames"] = orbit_frames
 
         # Send the command to Cinema 4D
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
 
         return format_c4d_response(response, "animate_camera")
 
@@ -1095,7 +1131,7 @@ async def execute_python_script(script: str, ctx: Context) -> str:
             return "❌ Not connected to Cinema 4D"
 
         # Send command to Cinema 4D
-        response = send_to_c4d(
+        response = await async_send_to_c4d(
             connection, {"command": "execute_python", "script": script}
         )
         return format_c4d_response(response, "execute_python")
@@ -1123,7 +1159,7 @@ async def group_objects(
             command["group_name"] = group_name
 
         # Send command to Cinema 4D
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
         return format_c4d_response(response, "group_objects")
 
 
@@ -1160,7 +1196,7 @@ async def render_preview(
         logger.info(f"Sending render_preview command with parameters: {command}")
 
         # Send command to Cinema 4D
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
 
         if "error" in response:
             return f"❌ Error: {response['error']}"
@@ -1192,9 +1228,462 @@ async def snapshot_scene(
         command["include_assets"] = include_assets
 
         # Send command to Cinema 4D
-        response = send_to_c4d(connection, command)
+        response = await async_send_to_c4d(connection, command)
 
         return format_c4d_response(response, "snapshot_scene")
+
+
+# Scene Nodes MCP tools. These wrappers deliberately return structured JSON so
+# node paths, port metadata, and per-operation errors are not lost in markdown.
+def _scene_nodes_json(response: Dict[str, Any]) -> str:
+    return json.dumps(response, ensure_ascii=False, indent=2, default=str)
+
+
+async def _call_scene_nodes(command: Dict[str, Any]) -> str:
+    async with c4d_connection_context() as connection:
+        if not connection.connected:
+            return _scene_nodes_json({"error": "Not connected to Cinema 4D"})
+        return _scene_nodes_json(await async_send_to_c4d(connection, command))
+
+
+def _validate_limit(limit: int, maximum: int) -> Optional[str]:
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > maximum:
+        return f"limit must be an integer between 1 and {maximum}"
+    return None
+
+
+def _bounded_scene_nodes_int(
+    value: int, name: str, minimum: int, maximum: int
+) -> tuple[Optional[int], Optional[str]]:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None, f"{name} must be an integer"
+    return max(minimum, min(value, maximum)), None
+
+
+def _validate_scene_nodes_debug_path(debug_path: Optional[str]) -> Optional[str]:
+    if debug_path is None:
+        return None
+    if not isinstance(debug_path, str) or not debug_path.strip():
+        return "debug_path must be a non-empty string"
+    if not os.path.isabs(debug_path) or not debug_path.lower().endswith(".json"):
+        return "debug_path must be an absolute .json path"
+    return None
+
+
+@mcp.tool()
+async def inspect_scene_nodes_graph(
+    node_path: Optional[str] = None,
+    node_paths: Optional[List[str]] = None,
+    limit: int = 1000,
+    max_ports: int = 2000,
+    max_connections: int = 2000,
+    max_bytes: int = 2_000_000,
+    include_ports: bool = True,
+    include_values: bool = True,
+    include_connections: bool = True,
+    debug_path: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Inspect the document-level Cinema 4D Scene Nodes graph."""
+    error = _validate_limit(limit, 2000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    max_ports, error = _bounded_scene_nodes_int(max_ports, "max_ports", 1, 10000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    max_connections, error = _bounded_scene_nodes_int(
+        max_connections, "max_connections", 1, 10000
+    )
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    max_bytes, error = _bounded_scene_nodes_int(
+        max_bytes, "max_bytes", 4096, 16000000
+    )
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    if node_path is not None and (not isinstance(node_path, str) or not node_path.strip()):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_path must be a non-empty string"})
+    if node_paths is not None and (
+        not isinstance(node_paths, list)
+        or any(not isinstance(path, str) or not path.strip() for path in node_paths)
+    ):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_paths must contain non-empty strings"})
+    if node_path is not None and node_paths is not None:
+        return _scene_nodes_json(
+            {
+                "error": "invalid_argument",
+                "message": "node_path and node_paths are mutually exclusive",
+            }
+        )
+    command = {
+        "command": "inspect_scene_nodes_graph",
+        "limit": limit,
+        "max_ports": max_ports,
+        "max_connections": max_connections,
+        "max_bytes": max_bytes,
+        "include_ports": bool(include_ports),
+        "include_values": bool(include_values),
+        "include_connections": bool(include_connections),
+    }
+    if node_path is not None:
+        command["node_path"] = node_path
+    if node_paths is not None:
+        command["node_paths"] = node_paths
+    error = _validate_scene_nodes_debug_path(debug_path)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    if debug_path is not None:
+        command["debug_path"] = debug_path
+    return await _call_scene_nodes(command)
+
+
+@mcp.tool()
+async def search_scene_node_assets(
+    query: str = "",
+    category: Optional[str] = None,
+    limit: int = 100,
+    ctx: Context = None,
+) -> str:
+    """Search installed Scene Nodes NodeTemplate assets."""
+    error = _validate_limit(limit, 1000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    if not isinstance(query, str) or not isinstance(category, (str, type(None))):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "query and category must be strings"})
+    command = {"command": "search_scene_node_assets", "query": query, "limit": limit}
+    if category:
+        command["category"] = category
+    return await _call_scene_nodes(command)
+
+
+@mcp.tool()
+async def describe_scene_node_asset(asset_id: str, ctx: Context = None) -> str:
+    """Describe a Scene Nodes asset in an isolated temporary document."""
+    if not isinstance(asset_id, str) or not asset_id.strip():
+        return _scene_nodes_json({"error": "invalid_argument", "message": "asset_id must be a non-empty string"})
+    return await _call_scene_nodes({"command": "describe_scene_node_asset", "asset_id": asset_id})
+
+
+@mcp.tool()
+async def edit_scene_nodes_graph(
+    operations: List[Dict[str, Any]],
+    layout: str = "component",
+    layout_after_batch: bool = True,
+    debug_path: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Apply ordered Scene Nodes graph operations with per-operation rollback."""
+    if not isinstance(operations, list) or not operations:
+        return _scene_nodes_json({"error": "invalid_argument", "message": "operations must be a non-empty list"})
+    if layout not in ("component", "none"):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "layout must be 'component' or 'none'"})
+    if not isinstance(layout_after_batch, bool):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "layout_after_batch must be boolean"})
+    seen = set()
+    for operation in operations:
+        if not isinstance(operation, dict):
+            return _scene_nodes_json({"error": "invalid_argument", "message": "each operation must be an object"})
+        op_id = operation.get("op_id")
+        op_name = operation.get("type", operation.get("operation"))
+        if not isinstance(op_id, str) or not op_id.strip() or op_id in seen:
+            return _scene_nodes_json({"error": "invalid_argument", "message": "op_id values must be unique non-empty strings"})
+        if op_name not in ("add_node", "set_port_value", "connect_ports", "disconnect_ports", "remove_node"):
+            return _scene_nodes_json({"error": "invalid_argument", "message": f"unsupported operation: {op_name}"})
+        seen.add(op_id)
+    command = {
+        "command": "edit_scene_nodes_graph",
+        "operations": operations,
+        "layout": layout,
+        "layout_after_batch": layout_after_batch,
+    }
+    error = _validate_scene_nodes_debug_path(debug_path)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    if debug_path is not None:
+        command["debug_path"] = debug_path
+    return await _call_scene_nodes(command)
+
+
+@mcp.tool()
+async def layout_scene_nodes_graph(
+    scope: str = "component",
+    node_path: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Run Cinema 4D's native Scene Nodes layout command."""
+    if scope not in ("component", "selected", "all"):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "scope must be 'component', 'selected', or 'all'"})
+    if scope == "all" and node_path is not None:
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_path cannot be used with scope='all'"})
+    if node_path is not None and (not isinstance(node_path, str) or not node_path.strip()):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_path must be a non-empty string"})
+    command = {"command": "layout_scene_nodes_graph", "scope": scope}
+    if node_path is not None:
+        command["node_path"] = node_path
+    return await _call_scene_nodes(command)
+
+
+# Capsule commands use the same structured transport as Scene Nodes, but every
+# graph operation is additionally bound to an explicit, persistent target.
+def _validate_capsule_graph_target(graph_target: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(graph_target, dict) or not graph_target:
+        return "graph_target must be a non-empty object"
+    owner_guid = graph_target.get("owner_guid")
+    if not isinstance(owner_guid, str) or not owner_guid.strip():
+        return "graph_target.owner_guid must be a non-empty string"
+    owner_type = graph_target.get("owner_type")
+    if owner_type not in ("object", "tag"):
+        return "graph_target.owner_type must be 'object' or 'tag'"
+    node_space = graph_target.get("node_space", graph_target.get("node_space_id"))
+    if not isinstance(node_space, str) or not node_space.strip():
+        return "graph_target.node_space must be a non-empty string"
+    for field in ("capsule_node_path", "asset_id", "asset_version"):
+        if field not in graph_target or not isinstance(graph_target[field], str):
+            return f"graph_target.{field} must be a string (empty is allowed)"
+    return None
+
+
+def _validate_capsule_operations(operations: List[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(operations, list) or not operations:
+        return "operations must be a non-empty list"
+    seen = set()
+    supported = {
+        "add_node",
+        "set_port_value",
+        "connect_ports",
+        "disconnect_ports",
+        "remove_node",
+    }
+    for operation in operations:
+        if not isinstance(operation, dict):
+            return "each operation must be an object"
+        op_id = operation.get("op_id")
+        op_name = operation.get("type", operation.get("operation"))
+        if not isinstance(op_id, str) or not op_id.strip() or op_id in seen:
+            return "op_id values must be unique non-empty strings"
+        if op_name not in supported:
+            return f"unsupported operation: {op_name}"
+        seen.add(op_id)
+    return None
+
+
+@mcp.tool()
+async def inspect_capsule_instances(
+    owner_guid: Optional[str] = None,
+    node_space: Optional[str] = None,
+    editable_only: bool = False,
+    limit: int = 1000,
+    max_bytes: int = 2_000_000,
+    ctx: Context = None,
+) -> str:
+    """Discover object, tag, and Capsule instance graphs in the active document."""
+    error = _validate_limit(limit, 5000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    max_bytes, error = _bounded_scene_nodes_int(max_bytes, "max_bytes", 4096, 16000000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    if owner_guid is not None and (not isinstance(owner_guid, str) or not owner_guid.strip()):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "owner_guid must be a non-empty string"})
+    if node_space is not None and (not isinstance(node_space, str) or not node_space.strip()):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_space must be a non-empty string"})
+    if not isinstance(editable_only, bool):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "editable_only must be boolean"})
+    command = {
+        "command": "inspect_capsule_instances",
+        "editable_only": editable_only,
+        "limit": limit,
+        "max_bytes": max_bytes,
+    }
+    if owner_guid is not None:
+        command["owner_guid"] = owner_guid
+    if node_space is not None:
+        command["node_space"] = node_space
+    return await _call_scene_nodes(command)
+
+
+@mcp.tool()
+async def inspect_capsule_graph(
+    graph_target: Dict[str, Any],
+    node_path: Optional[str] = None,
+    node_paths: Optional[List[str]] = None,
+    limit: int = 1000,
+    max_ports: int = 2000,
+    max_connections: int = 2000,
+    max_bytes: int = 2_000_000,
+    include_ports: bool = True,
+    include_values: bool = True,
+    include_connections: bool = True,
+    debug_path: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Inspect the exact Capsule instance graph identified by graph_target."""
+    error = _validate_capsule_graph_target(graph_target)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    error = _validate_limit(limit, 2000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    max_ports, error = _bounded_scene_nodes_int(max_ports, "max_ports", 1, 10000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    max_connections, error = _bounded_scene_nodes_int(max_connections, "max_connections", 1, 10000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    max_bytes, error = _bounded_scene_nodes_int(max_bytes, "max_bytes", 4096, 16000000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    if node_path is not None and (not isinstance(node_path, str) or not node_path.strip()):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_path must be a non-empty string"})
+    if node_paths is not None and (
+        not isinstance(node_paths, list)
+        or any(not isinstance(path, str) or not path.strip() for path in node_paths)
+    ):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_paths must contain non-empty strings"})
+    if node_path is not None and node_paths is not None:
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_path and node_paths are mutually exclusive"})
+    error = _validate_scene_nodes_debug_path(debug_path)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    command = {
+        "command": "inspect_capsule_graph",
+        "graph_target": graph_target,
+        "limit": limit,
+        "max_ports": max_ports,
+        "max_connections": max_connections,
+        "max_bytes": max_bytes,
+        "include_ports": bool(include_ports),
+        "include_values": bool(include_values),
+        "include_connections": bool(include_connections),
+    }
+    if node_path is not None:
+        command["node_path"] = node_path
+    if node_paths is not None:
+        command["node_paths"] = node_paths
+    if debug_path is not None:
+        command["debug_path"] = debug_path
+    return await _call_scene_nodes(command)
+
+
+@mcp.tool()
+async def focus_capsule_graph(
+    graph_target: Dict[str, Any],
+    ctx: Context = None,
+) -> str:
+    """Select a Capsule owner and request that Cinema 4D show its exact graph."""
+    error = _validate_capsule_graph_target(graph_target)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    return await _call_scene_nodes({"command": "focus_capsule_graph", "graph_target": graph_target})
+
+
+@mcp.tool()
+async def search_capsule_assets(
+    query: str = "",
+    category: Optional[str] = None,
+    node_space: Optional[str] = None,
+    limit: int = 100,
+    ctx: Context = None,
+) -> str:
+    """Search installed Capsule and NodeTemplate assets without modifying repositories."""
+    error = _validate_limit(limit, 1000)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    if not isinstance(query, str):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "query must be a string"})
+    if category is not None and not isinstance(category, str):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "category must be a string"})
+    if node_space is not None and (not isinstance(node_space, str) or not node_space.strip()):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_space must be a non-empty string"})
+    command = {"command": "search_capsule_assets", "query": query, "limit": limit}
+    if category:
+        command["category"] = category
+    if node_space is not None:
+        command["node_space"] = node_space
+    return await _call_scene_nodes(command)
+
+
+@mcp.tool()
+async def describe_capsule_asset(
+    asset_id: str,
+    asset_version: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Describe a Capsule asset using an isolated temporary document."""
+    if not isinstance(asset_id, str) or not asset_id.strip():
+        return _scene_nodes_json({"error": "invalid_argument", "message": "asset_id must be a non-empty string"})
+    if asset_version is not None and (not isinstance(asset_version, str) or not asset_version.strip()):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "asset_version must be a non-empty string"})
+    command = {"command": "describe_capsule_asset", "asset_id": asset_id}
+    if asset_version is not None:
+        command["asset_version"] = asset_version
+    return await _call_scene_nodes(command)
+
+
+@mcp.tool()
+async def edit_capsule_graph(
+    graph_target: Dict[str, Any],
+    operations: List[Dict[str, Any]],
+    focus_editor: bool = True,
+    write_mode: str = "instance_only",
+    layout: str = "component",
+    layout_after_batch: bool = True,
+    debug_path: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Edit one exact Capsule instance graph with ordered partial-success operations."""
+    error = _validate_capsule_graph_target(graph_target)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    error = _validate_capsule_operations(operations)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    if not isinstance(focus_editor, bool):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "focus_editor must be boolean"})
+    if write_mode != "instance_only":
+        return _scene_nodes_json({"error": "shared_asset_write_forbidden", "message": "write_mode must be 'instance_only'"})
+    if layout not in ("component", "none"):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "layout must be 'component' or 'none'"})
+    if not isinstance(layout_after_batch, bool):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "layout_after_batch must be boolean"})
+    error = _validate_scene_nodes_debug_path(debug_path)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    command = {
+        "command": "edit_capsule_graph",
+        "graph_target": graph_target,
+        "operations": operations,
+        "focus_editor": focus_editor,
+        "write_mode": write_mode,
+        "layout": layout,
+        "layout_after_batch": layout_after_batch,
+    }
+    if debug_path is not None:
+        command["debug_path"] = debug_path
+    return await _call_scene_nodes(command)
+
+
+@mcp.tool()
+async def layout_capsule_graph(
+    graph_target: Dict[str, Any],
+    scope: str = "component",
+    node_path: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Request native layout for one exact Capsule instance graph."""
+    error = _validate_capsule_graph_target(graph_target)
+    if error:
+        return _scene_nodes_json({"error": "invalid_argument", "message": error})
+    if scope not in ("component", "selected", "all"):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "scope must be 'component', 'selected', or 'all'"})
+    if scope == "all" and node_path is not None:
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_path cannot be used with scope='all'"})
+    if node_path is not None and (not isinstance(node_path, str) or not node_path.strip()):
+        return _scene_nodes_json({"error": "invalid_argument", "message": "node_path must be a non-empty string"})
+    command = {"command": "layout_capsule_graph", "graph_target": graph_target, "scope": scope}
+    if node_path is not None:
+        command["node_path"] = node_path
+    return await _call_scene_nodes(command)
 
 
 @mcp.resource("c4d://primitives")

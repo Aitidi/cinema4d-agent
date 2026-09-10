@@ -35,3 +35,11 @@ ENV/
 .DS_Store
 Thumbs.db
 
+
+# Local generated scenes, previews, and validation artifacts
+output/
+
+# Local credentials and runtime configuration
+.env
+.env.*
+!.env.example

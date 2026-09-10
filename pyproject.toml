@@ -12,10 +12,9 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.26.0,<2",
     "starlette",
 ]
 
 [project.scripts]
-cinema4d-mcp-wrapper = "cinema4d_mcp:main_wrapper"
 cinema4d-mcp = "cinema4d_mcp:main"

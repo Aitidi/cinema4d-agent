@@ -15,3 +15,15 @@
 {"command": "list_objects"}
 {"command": "snapshot_scene", "file_path": "/Users/winepegs/cinema4d-mcp/tests/test_harness_snapshot.c4d", "include_assets": true}
 {"command": "save_scene", "file_path": "/Users/winepegs/cinema4d-mcp/tests/test_harness_scene.c4d"}
+{"command": "inspect_scene_nodes_graph", "limit": 100, "include_values": true}
+{"command": "search_scene_node_assets", "query": "cube", "limit": 20}
+{"command": "describe_scene_node_asset", "asset_id": "net.maxon.neutron.node.primitive.cube"}
+{"command": "edit_scene_nodes_graph", "operations": [{"op_id": "add_test_node", "type": "add_node", "asset_id": "net.maxon.neutron.node.primitive.cube"}, {"op_id": "expected_failure", "type": "set_port_value", "node": {"op_id": "add_test_node"}, "port": "inputs/PORT_THAT_DOES_NOT_EXIST", "value": 1.0}], "layout": "component", "layout_after_batch": true}
+{"command": "layout_scene_nodes_graph", "scope": "all"}
+{"command": "inspect_capsule_instances", "editable_only": false, "limit": 100, "max_bytes": 2000000}
+{"command": "inspect_capsule_graph", "graph_target": {"owner_guid": "REPLACE_WITH_DISCOVERED_GUID", "owner_type": "object", "node_space": "net.maxon.neutron.nodespace", "capsule_node_path": "REPLACE_WITH_DISCOVERED_PATH", "asset_id": "", "asset_version": ""}, "limit": 100, "include_values": true}
+{"command": "focus_capsule_graph", "graph_target": {"owner_guid": "REPLACE_WITH_DISCOVERED_GUID", "owner_type": "object", "node_space": "net.maxon.neutron.nodespace", "capsule_node_path": "REPLACE_WITH_DISCOVERED_PATH", "asset_id": "", "asset_version": ""}}
+{"command": "search_capsule_assets", "query": "", "node_space": "net.maxon.neutron.nodespace", "limit": 20}
+{"command": "describe_capsule_asset", "asset_id": "REPLACE_WITH_DISCOVERED_ASSET_ID", "asset_version": "REPLACE_WITH_DISCOVERED_VERSION"}
+{"command": "edit_capsule_graph", "graph_target": {"owner_guid": "REPLACE_WITH_DISCOVERED_GUID", "owner_type": "object", "node_space": "net.maxon.neutron.nodespace", "capsule_node_path": "REPLACE_WITH_DISCOVERED_PATH", "asset_id": "", "asset_version": ""}, "operations": [{"op_id": "add_test_node", "type": "add_node", "asset_id": "REPLACE_WITH_NODE_TEMPLATE_ASSET_ID"}], "focus_editor": true, "write_mode": "instance_only", "layout": "component", "layout_after_batch": true}
+{"command": "layout_capsule_graph", "graph_target": {"owner_guid": "REPLACE_WITH_DISCOVERED_GUID", "owner_type": "object", "node_space": "net.maxon.neutron.nodespace", "capsule_node_path": "REPLACE_WITH_DISCOVERED_PATH", "asset_id": "", "asset_version": ""}, "scope": "all"}

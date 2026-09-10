@@ -1,6 +1,6 @@
 # Cinema4D MCP — Model Context Protocol (MCP) Server
 
-Cinema4D MCP Server connects Cinema 4D to Claude, enabling prompt-assisted 3D manipulation.
+Cinema4D MCP Server connects Cinema 4D to ChatGPT, Codex, Claude, and other MCP clients for prompt-assisted 3D manipulation.
 
 ## Table of Contents
 
@@ -43,10 +43,37 @@ cd cinema4d-mcp
 pip install -e .
 ```
 
-### Make the Wrapper Script Executable
+### Choose a Transport
+
+The default `stdio` transport is suitable for local MCP clients:
 
 ```bash
-chmod +x bin/cinema4d-mcp-wrapper
+cinema4d-mcp --transport stdio
+```
+
+For ChatGPT development and MCP Inspector, start the Streamable HTTP endpoint:
+
+```bash
+cinema4d-mcp --transport streamable-http --host 127.0.0.1 --port 8790 --path /mcp
+```
+
+The equivalent package command works on Windows without relying on a shell wrapper:
+
+```bash
+python -m cinema4d_mcp --transport streamable-http
+```
+
+On Windows, double-click `Start Cinema 4D Agent.cmd` to start Cinema 4D, wait for
+the plugin socket on port `5555`, start the MCP endpoint on port `8790`, and then
+start the OpenAI Tunnel on port `8787`. The launcher avoids duplicate processes
+and writes runtime logs under `%LOCALAPPDATA%\Cinema 4D Agent\runtime`.
+
+The PowerShell launcher also supports status, stop, and restart operations:
+
+```powershell
+.\bin\start-cinema4d-agent.ps1 -Action Status
+.\bin\start-cinema4d-agent.ps1 -Action Stop
+.\bin\start-cinema4d-agent.ps1 -Action Restart
 ```
 
 ## Setup
@@ -55,15 +82,16 @@ chmod +x bin/cinema4d-mcp-wrapper
 
 To set up the Cinema 4D plugin, follow these steps:
 
-1. **Copy the Plugin File**: Copy the `c4d_plugin/mcp_server_plugin.pyp` file to Cinema 4D's plugin folder. The path varies depending on your operating system:
+1. **Copy the Plugin Folder**: Copy the `c4d_plugin/Cinema 4D Agent` folder to Cinema 4D's plugin folder. The path varies depending on your operating system:
 
    - macOS: `/Users/USERNAME/Library/Preferences/Maxon/Maxon Cinema 4D/plugins/`
-   - Windows: `C:\Users\USERNAME\AppData\Roaming\Maxon\Maxon Cinema 4D\plugins\`
+   - Windows (Cinema 4D 2026): `C:\Program Files\Maxon Cinema 4D 2026\plugins\`
 
 2. **Start the Socket Server**:
-   - Open Cinema 4D.
-   - Go to Extensions > Socket Server Plugin
-   - You should see a Socket Server Control dialog window. Click Start Server.
+   - Open Cinema 4D. The socket server starts automatically in the background without opening the Cinema 4D Agent dialog.
+   - The server listens on `127.0.0.1:5555` by default and stops when Cinema 4D exits.
+   - Open **Extensions > Cinema 4D Agent** only when you want to view logs or use **Stop Server** and **Start Server**. Closing the dialog does not stop the server.
+   - Clear **Start/stop Server with Cinema 4D** to disable automatic startup on future Cinema 4D launches. The preference is saved between sessions; the two buttons continue to control the current session.
 
 ### Claude Desktop Configuration
 
@@ -86,28 +114,26 @@ To configure Claude Desktop, you need to modify its configuration file:
    }
    ```
 3. **Restart Claude Desktop** after updating the configuration file.
-<details>
 
-  <summary>[TODO] For published server</summary>
+### ChatGPT Developer Setup
 
-```json
-{
-  "mcpServers": {
-    "cinema4d": {
-      "command": "cinema4d-mcp-wrapper",
-      "args": []
-    }
-  }
-}
-```
+ChatGPT cannot connect directly to the Cinema 4D socket on port `5555`. Keep that socket private and connect ChatGPT to the standard MCP endpoint instead:
 
-   </details>
+1. Start Cinema 4D and confirm the Cinema 4D Agent socket is running.
+2. Start `cinema4d-mcp` with the `streamable-http` command above.
+3. Verify `http://127.0.0.1:8790/mcp` with MCP Inspector.
+4. Enable Developer mode in ChatGPT under **Settings > Security and login**.
+5. Create a [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) to the local MCP endpoint, then add that tunnel from [ChatGPT Plugins](https://chatgpt.com/plugins).
+
+Do not expose port `5555` to the internet. It is the private bridge between the Python MCP server and the Cinema 4D plugin, not an MCP transport.
+
+HTTP settings can also be supplied through `C4D_MCP_TRANSPORT`, `C4D_MCP_HTTP_HOST`, `C4D_MCP_HTTP_PORT`, and `C4D_MCP_HTTP_PATH`.
 
 ## Usage
 
 1. Ensure the Cinema 4D Socket Server is running.
-2. Open Claude Desktop and look for the hammer icon 🔨 in the input box, indicating MCP tools are available.
-3. Use the available [Tool Commands](#tool-commands) to interact with Cinema 4D through Claude.
+2. Start the MCP server using either `stdio` or `streamable-http`.
+3. Connect your MCP client and use the available [Tool Commands](#tool-commands).
 
 ## Agent Skill
 
@@ -121,6 +147,37 @@ The skill captures production-oriented guidance that sits on top of the raw MCP 
 - practical MoGraph extraction and debugging workflows
 
 ## Testing
+
+### Automated Regression Tests
+
+After installing the package, run from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The suite covers MCP argument forwarding, nonblocking socket communication and
+HTTP discovery during pending tool calls, cancellation cleanup, main-thread
+plugin dispatch, scene loading, empty Capsule targets, inspection truncation,
+and rolling log refresh. Plugin unit tests use SDK doubles and require no C4D
+installation.
+
+For native SDK validation, run `tests/c4d_smoke.py` on Cinema 4D's main thread
+using `runpy.run_path(<absolute script path>, run_name="__main__")`. It loads the
+candidate handler classes without registering another plugin, creates temporary
+documents, checks save/load and graph operations, restores the previous active
+document, and writes `output/review-validation/c4d-smoke.json`.
+
+After updating the plugin source, close Cinema 4D and install it again. The
+Windows installer targets `Program Files` and must be run from an administrator
+PowerShell session:
+
+```powershell
+.\bin\install-c4d-plugin.ps1
+```
+
+Restart Cinema 4D and the MCP process to load the updated code. Running the smoke
+test does not replace the installed plugin.
 
 ### Command Line Testing
 
@@ -167,10 +224,10 @@ This test harness is particularly useful for:
 
 2. Verify Cinema 4D shows connections in its console after you open Claude Desktop.
 
-3. Test the wrapper script directly:
+3. Check the command-line options:
 
    ```bash
-   cinema4d-mcp-wrapper
+   cinema4d-mcp --help
    ```
 
 4. If there are errors finding the mcp module, install it system-wide:
@@ -194,10 +251,9 @@ cinema4d-mcp/
 ├── main.py
 ├── pyproject.toml
 ├── setup.py
-├── bin/
-│   └── cinema4d-mcp-wrapper
 ├── c4d_plugin/
-│   └── mcp_server_plugin.pyp
+│   └── Cinema 4D Agent/
+│       └── mcp_server_plugin.pyp
 ├── src/
 │   └── cinema4d_mcp/
 │       ├── __init__.py
@@ -245,6 +301,62 @@ cinema4d-mcp/
 - `inspect_redshift_materials`: Read-only Redshift inspector with fallbacks for assignments, preview colors, readable params, a renderEngine-style node-material probe, and a Redshift GraphView fallback via `redshift.GetRSMaterialNodeMaster(...)`. ✅
   Known quirk: the top-level `capabilities.redshift_module_available` flag can still be `false` on some builds even when the per-material GraphView fallback succeeds. Treat each material's `graph.backend` and `graph.graphview.redshift_module_imported` as the authoritative signal.
 - `validate_redshift_materials`: Check Redshift material setup and connections. ✅ ⚠️ (Redshift materials not fully implemented)
+
+### Scene Nodes (Cinema 4D 2026.3.1)
+
+- `inspect_scene_nodes_graph`: Read the document Scene Nodes graph, including stable node/port paths, values, and connections. ✅
+- `search_scene_node_assets`: Search installed Scene Nodes templates and return stable asset IDs. ✅
+- `describe_scene_node_asset`: Inspect an installed template's ports and defaults without modifying the active document. ✅
+- `edit_scene_nodes_graph`: Run ordered add, value, connection, disconnection, and removal operations with per-operation rollback. ✅
+- `layout_scene_nodes_graph`: Apply Cinema 4D's native layout to a component, the current selection, or explicitly the whole graph. ✅
+
+Typical workflow:
+
+1. Search for an asset and describe it to obtain stable asset and port IDs.
+2. Inspect the existing graph and retain the returned absolute node paths.
+3. Submit one ordered edit batch. Each operation must have a unique `op_id`; successful independent operations remain committed when another operation fails.
+4. Leave the default `layout="component"` enabled to arrange the affected connected component once after the batch. Use `layout="none"` to preserve manual placement.
+
+```json
+{
+  "operations": [
+    {"op_id": "new_node", "type": "add_node", "asset_id": "<asset_id_from_search>"},
+    {
+      "op_id": "set_value",
+      "type": "set_port_value",
+      "node": {"op_id": "new_node"},
+      "port": "inputs/<port_id>",
+      "value": 1.0
+    }
+  ],
+  "layout": "component",
+  "layout_after_batch": true
+}
+```
+
+See the [Scene Nodes usage guide](docs/USAGE_GUIDE.md#scene-nodes) for complete examples, partial-success semantics, layout scopes, and harness setup.
+
+### Capsule Graphs (Cinema 4D 2026.3.1)
+
+- `inspect_capsule_instances`: Discover independent Nimbus graphs on scene objects and tags, then recursively expose nested Capsule node systems as separate stable `graph_target` values. ✅
+- `inspect_capsule_graph`: Inspect nodes, ports, values, and connections in one exact target graph. ✅
+- `focus_capsule_graph`: Select the target owner and ask the native Node Editor to show its graph. ✅ ⚠️
+- `search_capsule_assets`: Search installed Capsule and NodeTemplate assets without modifying the Asset Repository. ✅
+- `describe_capsule_asset`: Inspect public ports and editability in an isolated temporary document. ✅
+- `edit_capsule_graph`: Edit only the specified editable instance graph with ordered, partial-success operations. ✅
+- `layout_capsule_graph`: Request native layout for a component, selection, or explicitly the whole target graph. ⚠️
+
+Always obtain `graph_target` from `inspect_capsule_instances` and preserve the complete object. It binds edits to a Nimbus owner UUID, owner type, NodeSpace, and absolute Capsule node path; asset ID and version are also checked whenever Cinema 4D still exposes them. The graph currently visible in the Node Editor never determines where a node is written. Nimbus UUIDs work for both objects and tags and remain stable when an owner is renamed; do not reconstruct targets from display names.
+
+Nested Capsules on the same owner share the Nimbus owner UUID and NodeSpace but have different absolute `capsule_node_path` values. Their inspection and edits use a scoped graph view rooted at that path, so `add_node` creates inside the nested Capsule instead of at the owner graph root.
+
+Cinema 4D can clear a nested instance's direct AssetId after its internal graph is first materialized. Discovery then returns an empty asset ID with `asset_identity_status: "unavailable_after_materialization"`; routing remains exact through the owner UUID, NodeSpace, and absolute NodePath, but asset-version change detection is unavailable for that target.
+
+`edit_capsule_graph` fixes `write_mode` to `instance_only`; shared Capsule assets remain read-only. It tries to focus the editor first by default and keeps the target owner selected. Cinema 4D 2026.3.1 cannot expose the active Node Editor graph through Python, so a successful native focus request reports `focus_status: "best_effort"`, `editor_opened: null`, `node_space_matches: null`, and `graph_verified: false`. Backend editing still uses the independently resolved target graph.
+
+Cinema 4D 2026.3.1 does not expose a working Python invocation for native Node Editor layout in all contexts. In that case layout returns `layout_status: "unavailable"`; it does not guess node sizes or apply fixed coordinates.
+
+See the [Capsule Graphs usage guide](docs/USAGE_GUIDE.md#capsule-graphs) for target examples and safety boundaries.
 
 ### MoGraph & Fields
 
