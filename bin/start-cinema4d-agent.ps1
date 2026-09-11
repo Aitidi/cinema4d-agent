@@ -164,12 +164,14 @@ function Start-All {
         Start-Process -FilePath $Cinema4DExe | Out-Null
         Remove-Item Env:C4D_AGENT_FORCE_START -ErrorAction SilentlyContinue
     }
+    Write-Step "正在等待 C4D 插件连接（最多 45 秒）..."
+    Write-Step "若尚未启动插件，请在 C4D 中打开：扩展 → Cinema 4D Agent → Start Server。"
     if (Wait-TcpPort $C4DPort 45) {
         Write-Ok "C4D 插件服务已在线（$C4DPort）。"
     }
     else {
         Write-Warn "C4D 已打开，但插件服务 $C4DPort 尚未在线。"
-        Write-Warn "请在 C4D 的“扩展 → Cinema 4D Agent”中点击 Start Server，并勾选随 C4D 启动。"
+        Write-Warn "请在 C4D 的 扩展 → Cinema 4D Agent 中点击 Start Server，并勾选随 C4D 启动。"
     }
 
     if (Test-TcpPort $McpPort) {
